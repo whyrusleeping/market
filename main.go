@@ -634,9 +634,10 @@ type Repo struct {
 }
 
 type Post struct {
-	ID      uint `gorm:"primarykey"`
-	Created time.Time
-	Indexed time.Time
+	ID        uint `gorm:"primarykey"`
+	Created   time.Time
+	Indexed   time.Time
+	DeletedAt gorm.DeletedAt
 
 	Author   uint   `gorm:"uniqueIndex:idx_post_rkeyauthor"`
 	Rkey     string `gorm:"uniqueIndex:idx_post_rkeyauthor"`
@@ -894,7 +895,11 @@ func (s *Server) handleCreatePost(ctx context.Context, repo *Repo, rkey string, 
 		Raw:     recb,
 	}
 
-	if rec.Reply != nil {
+	if rec.Reply != nil && rec.Reply.Parent != nil {
+		if rec.Reply.Root == nil {
+			return fmt.Errorf("post reply had nil root")
+		}
+
 		pinfo, err := s.postInfoForUri(ctx, rec.Reply.Parent.Uri)
 		if err != nil {
 			return fmt.Errorf("getting reply parent: %w", err)
@@ -931,10 +936,12 @@ func (s *Server) handleCreatePost(ctx context.Context, repo *Repo, rkey string, 
 	if rec.Embed != nil {
 
 		var rpref string
-		if rec.Embed.EmbedRecord != nil {
+		if rec.Embed.EmbedRecord != nil && rec.Embed.EmbedRecord.Record != nil {
 			rpref = rec.Embed.EmbedRecord.Record.Uri
 		}
-		if rec.Embed.EmbedRecordWithMedia != nil {
+		if rec.Embed.EmbedRecordWithMedia != nil &&
+			rec.Embed.EmbedRecordWithMedia.Record != nil &&
+			rec.Embed.EmbedRecordWithMedia.Record.Record != nil {
 			rpref = rec.Embed.EmbedRecordWithMedia.Record.Record.Uri
 		}
 
@@ -1378,7 +1385,7 @@ func (s *Server) handleDeletePost(ctx context.Context, repo *Repo, rkey string) 
 		return err
 	}
 
-	if rec.Reply != nil {
+	if rec.Reply != nil && rec.Reply.Parent != nil {
 		reptoid, err := s.postIDForUri(ctx, rec.Reply.Parent.Uri)
 		if err != nil {
 			return fmt.Errorf("getting reply parent: %w", err)
@@ -1412,10 +1419,12 @@ func (s *Server) handleDeletePost(ctx context.Context, repo *Repo, rkey string) 
 
 	if rec.Embed != nil {
 		var rpref string
-		if rec.Embed.EmbedRecord != nil {
+		if rec.Embed.EmbedRecord != nil && rec.Embed.EmbedRecord.Record != nil {
 			rpref = rec.Embed.EmbedRecord.Record.Uri
 		}
-		if rec.Embed.EmbedRecordWithMedia != nil {
+		if rec.Embed.EmbedRecordWithMedia != nil &&
+			rec.Embed.EmbedRecordWithMedia.Record != nil &&
+			rec.Embed.EmbedRecordWithMedia.Record.Record != nil {
 			rpref = rec.Embed.EmbedRecordWithMedia.Record.Record.Uri
 		}
 
@@ -1438,7 +1447,7 @@ func (s *Server) handleDeletePost(ctx context.Context, repo *Repo, rkey string) 
 		}
 	}
 
-	if err := s.db.Exec("DELETE FROM posts WHERE id = ?", p.ID).Error; err != nil {
+	if err := s.db.Delete(&Post{}, p.ID).Error; err != nil {
 		return err
 	}
 
