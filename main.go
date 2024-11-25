@@ -349,6 +349,25 @@ func (s *Server) startLiveTail(curs int) error {
 
 	s.con = con
 
+	var lelk sync.Mutex
+	lastEvent := time.Now()
+
+	go func() {
+		for range time.Tick(time.Second) {
+			lelk.Lock()
+			let := lastEvent
+			lelk.Unlock()
+
+			if time.Since(let) > time.Second*30 {
+				slog.Error("firehose connection timed out")
+				con.Close()
+				return
+			}
+
+		}
+
+	}()
+
 	rsc := &events.RepoStreamCallbacks{
 		RepoCommit: func(evt *atproto.SyncSubscribeRepos_Commit) error {
 			ctx := context.Background()
@@ -356,6 +375,10 @@ func (s *Server) startLiveTail(curs int) error {
 			s.seqLk.Lock()
 			s.lastSeq = evt.Seq
 			s.seqLk.Unlock()
+
+			lelk.Lock()
+			lastEvent = time.Now()
+			lelk.Unlock()
 
 			if err := s.bf.HandleEvent(ctx, evt); err != nil {
 				return fmt.Errorf("handle event (%s,%d): %w", evt.Repo, evt.Seq, err)
