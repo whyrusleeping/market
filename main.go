@@ -37,6 +37,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/urfave/cli/v2"
+	. "github.com/whyrusleeping/market/models"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
@@ -518,9 +519,9 @@ func (s *Server) getOrCreateRepo(ctx context.Context, did string) (*Repo, error)
 		s.reposLk.Unlock()
 	}
 
-	r.lk.Lock()
-	defer r.lk.Unlock()
-	if r.setup {
+	r.Lk.Lock()
+	defer r.Lk.Unlock()
+	if r.Setup {
 		return r, nil
 	}
 
@@ -530,7 +531,7 @@ func (s *Server) getOrCreateRepo(ctx context.Context, did string) (*Repo, error)
 
 	if r.ID != 0 {
 		// found it!
-		r.setup = true
+		r.Setup = true
 		return r, nil
 	}
 
@@ -539,7 +540,7 @@ func (s *Server) getOrCreateRepo(ctx context.Context, did string) (*Repo, error)
 		return nil, err
 	}
 
-	r.setup = true
+	r.Setup = true
 
 	return r, nil
 }
@@ -643,152 +644,6 @@ func (s *Server) getPostByUri(ctx context.Context, uri string) (*Post, error) {
 	})
 
 	return &post, nil
-}
-
-type Repo struct {
-	ID        uint `gorm:"primarykey"`
-	CreatedAt time.Time
-	Did       string `gorm:"uniqueIndex"`
-	Handle    string
-
-	// cache fields
-	lk    sync.Mutex
-	setup bool
-}
-
-type Post struct {
-	ID        uint `gorm:"primarykey"`
-	Created   time.Time
-	Indexed   time.Time
-	DeletedAt gorm.DeletedAt
-
-	Author   uint   `gorm:"uniqueIndex:idx_post_rkeyauthor"`
-	Rkey     string `gorm:"uniqueIndex:idx_post_rkeyauthor"`
-	Raw      []byte
-	NotFound bool
-	Cid      string
-
-	Reposting  uint
-	ReplyTo    uint
-	ReplyToUsr uint
-	InThread   uint
-}
-
-type PostCounts struct {
-	Post       uint `gorm:"uniqueindex"`
-	Likes      int
-	Replies    int
-	Reposts    int
-	Quotes     int
-	ThreadSize int
-}
-
-type PostCountsTask struct {
-	Post uint
-	Op   string
-	Val  int
-}
-
-type Follow struct {
-	ID      uint `gorm:"primarykey"`
-	Created time.Time
-	Indexed time.Time
-	Rkey    string `gorm:"uniqueIndex:idx_follow_rkeyauthor"`
-	Author  uint   `gorm:"uniqueIndex:idx_follow_rkeyauthor"`
-	Subject uint
-}
-
-type Block struct {
-	ID      uint `gorm:"primarykey"`
-	Created time.Time
-	Indexed time.Time
-	Rkey    string `gorm:"uniqueIndex:idx_blocks_rkeyauthor"`
-	Author  uint   `gorm:"uniqueIndex:idx_blocks_rkeyauthor"`
-	Subject uint
-}
-
-type Like struct {
-	ID      uint `gorm:"primarykey"`
-	Created time.Time
-	Indexed time.Time
-	Author  uint   `gorm:"uniqueIndex:idx_likes_rkeyauthor"`
-	Rkey    string `gorm:"uniqueIndex:idx_likes_rkeyauthor"`
-	Subject uint
-}
-
-type Repost struct {
-	ID      uint `gorm:"primarykey"`
-	Created time.Time
-	Indexed time.Time
-	Author  uint   `gorm:"uniqueIndex:idx_reposts_rkeyauthor"`
-	Rkey    string `gorm:"uniqueIndex:idx_reposts_rkeyauthor"`
-	Subject uint
-}
-
-type List struct {
-	ID      uint `gorm:"primarykey"`
-	Created time.Time
-	Indexed time.Time
-	Author  uint   `gorm:"uniqueIndex:idx_lists_rkeyauthor"`
-	Rkey    string `gorm:"uniqueIndex:idx_lists_rkeyauthor"`
-	Raw     []byte
-}
-
-type ListItem struct {
-	ID      uint `gorm:"primarykey"`
-	Created time.Time
-	Indexed time.Time
-	Author  uint   `gorm:"uniqueIndex:idx_listitems_rkeyauthor"`
-	Rkey    string `gorm:"uniqueIndex:idx_listitems_rkeyauthor"`
-	Subject uint
-	List    uint
-}
-
-type ListBlock struct {
-	ID      uint `gorm:"primarykey"`
-	Created time.Time
-	Indexed time.Time
-	Author  uint   `gorm:"uniqueIndex:idx_listblocks_rkeyauthor"`
-	Rkey    string `gorm:"uniqueIndex:idx_listblocks_rkeyauthor"`
-	List    uint
-}
-
-type Profile struct {
-	ID      uint `gorm:"primarykey"`
-	Created time.Time
-	Indexed time.Time
-	Repo    uint
-	Raw     []byte
-}
-
-type FeedGenerator struct {
-	ID      uint `gorm:"primarykey"`
-	Created time.Time
-	Indexed time.Time
-	Author  uint   `gorm:"uniqueIndex:idx_feedgen_rkeyauthor"`
-	Rkey    string `gorm:"uniqueIndex:idx_feedgen_rkeyauthor"`
-	Raw     []byte
-	Did     string
-}
-
-type ThreadGate struct {
-	ID      uint `gorm:"primarykey"`
-	Created time.Time
-	Indexed time.Time
-	Author  uint   `gorm:"uniqueIndex:idx_threadgate_rkeyauthor"`
-	Rkey    string `gorm:"uniqueIndex:idx_threadgate_rkeyauthor"`
-	Raw     []byte
-	Post    uint
-}
-
-type Image struct {
-	ID     uint `gorm:"primarykey"`
-	Post   uint `gorm:"index"`
-	Cid    string
-	Did    string
-	Mime   string
-	Cached bool
-	Failed bool
 }
 
 func (s *Server) revForRepo(rr *Repo) (string, error) {
