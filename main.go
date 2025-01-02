@@ -273,7 +273,7 @@ func (s *Server) flushCursor() error {
 	v := s.lastSeq
 	s.seqLk.Unlock()
 
-	if err := s.db.Model(cursorRecord{}).Where("id = 1").Update("val", v).Error; err != nil {
+	if err := s.db.Model(cursorRecord{}).Where("id = 1 AND val < ?", v).Update("val", v).Error; err != nil {
 		return err
 	}
 
@@ -375,6 +375,11 @@ func (s *Server) startLiveTail(curs int) error {
 			ctx := context.Background()
 
 			s.seqLk.Lock()
+			if evt.Seq < s.lastSeq {
+				s.seqLk.Unlock()
+				return nil
+			}
+			curs = int(evt.Seq)
 			s.lastSeq = evt.Seq
 			s.seqLk.Unlock()
 
@@ -732,7 +737,7 @@ func (s *Server) handleCreate(ctx context.Context, repo string, rev string, path
 			return err
 		}
 	case "app.bsky.actor.profile":
-		if err := s.handleCreateProfile(ctx, rr, rkey, *rec, *cid); err != nil {
+		if err := s.handleCreateProfile(ctx, rr, rkey, rev, *rec, *cid); err != nil {
 			return err
 		}
 	case "app.bsky.feed.generator":
@@ -902,6 +907,9 @@ func (s *Server) handleCreateLike(ctx context.Context, repo *Repo, rkey string, 
 	}
 
 	if err := s.db.Exec(`INSERT INTO "likes" ("created","indexed","author","rkey","subject") VALUES (?,?,?,?,?)`, created.Time(), time.Now(), repo.ID, rkey, pid).Error; err != nil {
+		if errors.Is(err, gorm.ErrDuplicatedKey) {
+			return nil
+		}
 		return err
 	}
 
@@ -974,6 +982,9 @@ func (s *Server) handleCreateFollow(ctx context.Context, repo *Repo, rkey string
 		Rkey:    rkey,
 		Subject: subj.ID,
 	}).Error; err != nil {
+		if errors.Is(err, gorm.ErrDuplicatedKey) {
+			return nil
+		}
 		return err
 	}
 
@@ -1093,12 +1104,27 @@ func (s *Server) handleCreateListblock(ctx context.Context, repo *Repo, rkey str
 	return nil
 }
 
-func (s *Server) handleCreateProfile(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
+func (s *Server) handleCreateProfile(ctx context.Context, repo *Repo, rkey, rev string, recb []byte, cc cid.Cid) error {
 	if err := s.db.Create(&Profile{
 		//Created: created.Time(),
 		Indexed: time.Now(),
 		Repo:    repo.ID,
 		Raw:     recb,
+		Rev:     rev,
+	}).Error; err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Server) handleUpdateProfile(ctx context.Context, repo *Repo, rkey, rev string, recb []byte, cc cid.Cid) error {
+	if err := s.db.Create(&Profile{
+		//Created: created.Time(),
+		Indexed: time.Now(),
+		Repo:    repo.ID,
+		Raw:     recb,
+		Rev:     rev,
 	}).Error; err != nil {
 		return err
 	}
@@ -1165,7 +1191,96 @@ func (s *Server) handleCreateChatDeclaration(ctx context.Context, repo *Repo, rk
 }
 
 func (s *Server) handleUpdate(ctx context.Context, repo string, rev string, path string, rec *[]byte, cid *cid.Cid) error {
-	// TODO:
+	start := time.Now()
+
+	rr, err := s.getOrCreateRepo(ctx, repo)
+	if err != nil {
+		return fmt.Errorf("get user failed: %w", err)
+	}
+
+	lrev, err := s.revForRepo(rr)
+	if err != nil {
+		return err
+	}
+	if lrev != "" {
+		if rev < lrev {
+			//slog.Info("skipping old rev create", "did", rr.Did, "rev", rev, "oldrev", lrev, "path", path)
+			return nil
+		}
+	}
+
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid path in handleCreate: %q", path)
+	}
+	col := parts[0]
+	rkey := parts[1]
+
+	defer func() {
+		handleOpHist.WithLabelValues("update", col).Observe(float64(time.Since(start).Milliseconds()))
+	}()
+
+	if rkey == "" {
+		fmt.Printf("messed up path: %q\n", rkey)
+	}
+
+	switch col {
+	/*
+		case "app.bsky.feed.post":
+			if err := s.handleCreatePost(ctx, rr, rkey, *rec, *cid); err != nil {
+				return err
+			}
+		case "app.bsky.feed.like":
+			if err := s.handleCreateLike(ctx, rr, rkey, *rec, *cid); err != nil {
+				return err
+			}
+		case "app.bsky.feed.repost":
+			if err := s.handleCreateRepost(ctx, rr, rkey, *rec, *cid); err != nil {
+				return err
+			}
+		case "app.bsky.graph.follow":
+			if err := s.handleCreateFollow(ctx, rr, rkey, *rec, *cid); err != nil {
+				return err
+			}
+		case "app.bsky.graph.block":
+			if err := s.handleCreateBlock(ctx, rr, rkey, *rec, *cid); err != nil {
+				return err
+			}
+		case "app.bsky.graph.list":
+			if err := s.handleCreateList(ctx, rr, rkey, *rec, *cid); err != nil {
+				return err
+			}
+		case "app.bsky.graph.listitem":
+			if err := s.handleCreateListitem(ctx, rr, rkey, *rec, *cid); err != nil {
+				return err
+			}
+		case "app.bsky.graph.listblock":
+			if err := s.handleCreateListblock(ctx, rr, rkey, *rec, *cid); err != nil {
+				return err
+			}
+	*/
+	case "app.bsky.actor.profile":
+		if err := s.handleUpdateProfile(ctx, rr, rkey, rev, *rec, *cid); err != nil {
+			return err
+		}
+		/*
+			case "app.bsky.feed.generator":
+				if err := s.handleCreateFeedGenerator(ctx, rr, rkey, *rec, *cid); err != nil {
+					return err
+				}
+			case "app.bsky.feed.threadgate":
+				if err := s.handleCreateThreadgate(ctx, rr, rkey, *rec, *cid); err != nil {
+					return err
+				}
+			case "chat.bsky.actor.declaration":
+				if err := s.handleCreateChatDeclaration(ctx, rr, rkey, *rec, *cid); err != nil {
+					return err
+				}
+		*/
+	default:
+		return fmt.Errorf("unrecognized record type: %q", col)
+	}
+
 	return nil
 }
 

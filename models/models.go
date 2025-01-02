@@ -121,6 +121,7 @@ type Profile struct {
 	Indexed time.Time
 	Repo    uint
 	Raw     []byte
+	Rev     string
 }
 
 type FeedGenerator struct {
