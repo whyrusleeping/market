@@ -133,7 +133,6 @@ func main() {
 		}
 
 		opts := backfill.DefaultBackfillOptions()
-		opts.CheckoutPath = "https://bsky.network/xrpc/com.atproto.sync.getRepo"
 		opts.SyncRequestsPerSecond = 20
 		opts.ParallelBackfills = 50
 
@@ -164,10 +163,12 @@ func main() {
 			return err
 		}
 
+		sl := slog.Default()
+
 		streamClosed := make(chan struct{})
 		streamCtx, streamCancel := context.WithCancel(context.Background())
 		go func() {
-			if err := events.HandleRepoStream(streamCtx, s.con, s.eventScheduler); err != nil {
+			if err := events.HandleRepoStream(streamCtx, s.con, s.eventScheduler, sl); err != nil {
 				slog.Error("repo stream failed", "err", err)
 			}
 			close(streamClosed)
