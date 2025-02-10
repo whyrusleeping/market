@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"cloud.google.com/go/bigquery"
 	"github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/api/bsky"
 	"github.com/bluesky-social/indigo/atproto/syntax"
@@ -38,6 +39,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/urfave/cli/v2"
 	. "github.com/whyrusleeping/market/models"
+	"google.golang.org/api/option"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
@@ -70,6 +72,15 @@ func main() {
 		&cli.StringFlag{
 			Name: "image-cache-server",
 		},
+		&cli.BoolFlag{
+			Name: "enable-biqquery-backend",
+		},
+		&cli.StringFlag{
+			Name: "bigquery-auth",
+		},
+		&cli.StringFlag{
+			Name: "biqquery-project",
+		},
 	}
 	app.Action = func(cctx *cli.Context) error {
 
@@ -86,37 +97,86 @@ func main() {
 		})
 
 		db.AutoMigrate(backfill.GormDBJob{})
-		db.AutoMigrate(Repo{})
-		db.AutoMigrate(Post{})
-		db.AutoMigrate(PostCounts{})
-		db.AutoMigrate(PostCountsTask{})
-		db.AutoMigrate(Follow{})
-		db.AutoMigrate(Block{})
-		db.AutoMigrate(Like{})
-		db.AutoMigrate(Repost{})
-		db.AutoMigrate(List{})
-		db.AutoMigrate(ListItem{})
-		db.AutoMigrate(ListBlock{})
-		db.AutoMigrate(Profile{})
-		db.AutoMigrate(ThreadGate{})
-		db.AutoMigrate(FeedGenerator{})
 		db.AutoMigrate(cursorRecord{})
-		db.AutoMigrate(MarketConfig{})
-		db.AutoMigrate(Image{})
 
-		rc, _ := lru.New2Q[string, *Repo](1_000_000)
-		pc, _ := lru.New2Q[string, *cachedPostInfo](5_000_000)
-		revc, _ := lru.New2Q[uint, string](1_000_000)
+		useBigQuery := cctx.Bool("enable-biqquery-backend")
+
+		gstore := backfill.NewGormstore(db)
+
+		var bend Backend
+		if useBigQuery {
+
+			auth := cctx.String("bigquery-auth")
+			if auth == "" {
+				return fmt.Errorf("must specify bigquery-auth")
+			}
+
+			projectID := cctx.String("bigquery-project")
+			datasetID := cctx.String("bigquery-dataset")
+
+			client, err := bigquery.NewClient(context.TODO(), projectID, option.WithCredentialsFile(auth))
+			if err != nil {
+				return err
+			}
+
+			dataset := client.Dataset(datasetID)
+
+			rc, _ := lru.New2Q[string, *Repo](1_000_000)
+			pc, _ := lru.New2Q[string, *cachedPostInfo](5_000_000)
+
+			bqb := &BigQueryBackend{
+				bfstore: gstore,
+
+				client:    client,
+				dataset:   dataset,
+				projectID: projectID,
+				datasetID: datasetID,
+				postCache: pc,
+				repoCache: rc,
+			}
+
+			bend = bqb
+		} else {
+			db.AutoMigrate(Repo{})
+			db.AutoMigrate(Post{})
+			db.AutoMigrate(PostCounts{})
+			db.AutoMigrate(PostCountsTask{})
+			db.AutoMigrate(Follow{})
+			db.AutoMigrate(Block{})
+			db.AutoMigrate(Like{})
+			db.AutoMigrate(Repost{})
+			db.AutoMigrate(List{})
+			db.AutoMigrate(ListItem{})
+			db.AutoMigrate(ListBlock{})
+			db.AutoMigrate(Profile{})
+			db.AutoMigrate(ThreadGate{})
+			db.AutoMigrate(FeedGenerator{})
+			db.AutoMigrate(MarketConfig{})
+			db.AutoMigrate(Image{})
+
+			rc, _ := lru.New2Q[string, *Repo](1_000_000)
+			pc, _ := lru.New2Q[string, *cachedPostInfo](5_000_000)
+			revc, _ := lru.New2Q[uint, string](1_000_000)
+
+			pgb := &PostgresBackend{
+				bfstore:       gstore,
+				db:            db,
+				postInfoCache: pc,
+				repoCache:     rc,
+				revCache:      revc,
+			}
+			go pgb.runCountAggregator()
+
+			bend = pgb
+		}
+
 		s := &Server{
-			db:               db,
-			repoCache:        rc,
-			postInfoCache:    pc,
-			revCache:         revc,
+			backend:          bend,
 			imageCacheDir:    cctx.String("image-dir"),
 			imageCacheServer: cctx.String("image-cache-server"),
 		}
 
-		curs, err := s.loadCursor()
+		curs, err := s.LoadCursor(context.TODO())
 		if err != nil {
 			return err
 		}
@@ -124,8 +184,6 @@ func main() {
 		go s.syncCursorRoutine()
 
 		go s.imageFetcher()
-
-		gstore := backfill.NewGormstore(db)
 
 		ctx := context.TODO()
 		if err := gstore.LoadJobs(ctx); err != nil {
@@ -136,13 +194,11 @@ func main() {
 		opts.SyncRequestsPerSecond = 20
 		opts.ParallelBackfills = 50
 
-		bf := backfill.NewBackfiller("market", gstore, s.handleCreate, s.handleUpdate, s.handleDelete, opts)
+		bf := backfill.NewBackfiller("market", gstore, s.backend.HandleCreate, s.backend.HandleUpdate, s.backend.HandleDelete, opts)
 		s.bf = bf
 		s.store = gstore
 
 		go bf.Start()
-
-		go s.runCountAggregator()
 
 		go func() {
 			if err := s.maybePumpRepos(context.TODO()); err != nil {
@@ -151,6 +207,9 @@ func main() {
 		}()
 
 		if s.imagesEnabled() {
+			if useBigQuery {
+				return fmt.Errorf("cannot run image fetching with bigquery backend")
+			}
 			go func() {
 				if err := s.crawlOldPostsForPictures(); err != nil {
 					slog.Error("backfill pump failed", "err", err)
@@ -190,7 +249,7 @@ func main() {
 			streamCancel()
 			<-streamClosed
 
-			if err := s.flushCursor(); err != nil {
+			if err := s.FlushCursor(); err != nil {
 				slog.Error("final flush cursor failed", "err", err)
 			}
 
@@ -200,7 +259,9 @@ func main() {
 
 		go func() {
 			http.Handle("/metrics", promhttp.Handler())
-			http.HandleFunc("/images/", s.handleServeImage)
+			if !useBigQuery {
+				http.HandleFunc("/images/", s.handleServeImage)
+			}
 			http.ListenAndServe(":5151", nil)
 
 		}()
@@ -213,25 +274,43 @@ func main() {
 	app.RunAndExitOnError()
 }
 
+type Backend interface {
+	HandleCreate(ctx context.Context, repo string, rev string, path string, rec *[]byte, cid *cid.Cid) error
+	HandleUpdate(ctx context.Context, repo string, rev string, path string, rec *[]byte, cid *cid.Cid) error
+	HandleDelete(ctx context.Context, repo string, rev string, path string) error
+
+	// Create handlers
+	HandleCreatePost(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error
+	HandleCreateLike(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error
+	HandleCreateRepost(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error
+	HandleCreateFollow(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error
+	HandleCreateProfile(ctx context.Context, repo *Repo, rkey string, rev string, recb []byte, cc cid.Cid) error
+
+	// Delete handlers
+	HandleDeletePost(ctx context.Context, repo *Repo, rkey string) error
+	HandleDeleteLike(ctx context.Context, repo *Repo, rkey string) error
+	HandleDeleteRepost(ctx context.Context, repo *Repo, rkey string) error
+	HandleDeleteFollow(ctx context.Context, repo *Repo, rkey string) error
+	HandleDeleteProfile(ctx context.Context, repo *Repo, rkey string) error
+
+	// Update handlers
+	HandleUpdateProfile(ctx context.Context, repo *Repo, rkey string, rev string, recb []byte, cc cid.Cid) error
+}
+
 type Server struct {
-	db    *gorm.DB
 	bf    *backfill.Backfiller
 	store *backfill.Gormstore
+	bfdb  *gorm.DB
 
 	lastSeq int64
 	seqLk   sync.Mutex
+
+	backend Backend
 
 	con *websocket.Conn
 
 	eventScheduler events.Scheduler
 	streamFinished chan struct{}
-
-	repoCache *lru.TwoQueueCache[string, *Repo]
-	reposLk   sync.Mutex
-
-	postInfoCache *lru.TwoQueueCache[string, *cachedPostInfo]
-
-	revCache *lru.TwoQueueCache[uint, string]
 
 	imageCacheDir    string
 	imageCacheServer string
@@ -246,13 +325,13 @@ type cursorRecord struct {
 	Val int
 }
 
-func (s *Server) loadCursor() (int, error) {
+func (s *Server) LoadCursor(ctx context.Context) (int, error) {
 	var rec cursorRecord
-	if err := s.db.Find(&rec, "id = 1").Error; err != nil {
+	if err := s.bfdb.Find(&rec, "id = 1").Error; err != nil {
 		return 0, err
 	}
 	if rec.ID == 0 {
-		if err := s.db.Create(&cursorRecord{ID: 1}).Error; err != nil {
+		if err := s.bfdb.Create(&cursorRecord{ID: 1}).Error; err != nil {
 			return 0, err
 		}
 	}
@@ -262,18 +341,18 @@ func (s *Server) loadCursor() (int, error) {
 
 func (s *Server) syncCursorRoutine() {
 	for range time.Tick(time.Second * 5) {
-		if err := s.flushCursor(); err != nil {
+		if err := s.FlushCursor(); err != nil {
 			slog.Error("failed to flush cursor", "err", err)
 		}
 	}
 }
 
-func (s *Server) flushCursor() error {
+func (s *Server) FlushCursor() error {
 	s.seqLk.Lock()
 	v := s.lastSeq
 	s.seqLk.Unlock()
 
-	if err := s.db.Model(cursorRecord{}).Where("id = 1 AND val < ?", v).Update("val", v).Error; err != nil {
+	if err := s.bfdb.Model(cursorRecord{}).Where("id = 1 AND val < ?", v).Update("val", v).Error; err != nil {
 		return err
 	}
 
@@ -287,13 +366,13 @@ type MarketConfig struct {
 
 func (s *Server) maybePumpRepos(ctx context.Context) error {
 	var cfg MarketConfig
-	if err := s.db.Find(&cfg, "id = 1").Error; err != nil {
+	if err := s.bfdb.Find(&cfg, "id = 1").Error; err != nil {
 		return err
 	}
 
 	if cfg.ID == 0 {
 		cfg.ID = 1
-		if err := s.db.Create(&cfg).Error; err != nil {
+		if err := s.bfdb.Create(&cfg).Error; err != nil {
 			return err
 		}
 	}
@@ -328,7 +407,7 @@ func (s *Server) maybePumpRepos(ctx context.Context) error {
 		}
 	}
 
-	if err := s.db.Model(MarketConfig{}).Where("id = 1").Update("repo_scan_done", true).Error; err != nil {
+	if err := s.bfdb.Model(MarketConfig{}).Where("id = 1").Update("repo_scan_done", true).Error; err != nil {
 		return err
 	}
 
@@ -433,9 +512,9 @@ func sleepForWorksize(np int) {
 	}
 }
 
-func (s *Server) runCountAggregator() {
+func (b *PostgresBackend) runCountAggregator() {
 	for {
-		np, err := s.aggregateCounts()
+		np, err := b.aggregateCounts()
 		if err != nil {
 			slog.Error("failed to aggregate counts", "err", err)
 		}
@@ -444,9 +523,9 @@ func (s *Server) runCountAggregator() {
 	}
 }
 
-func (s *Server) aggregateCounts() (int, error) {
+func (b *PostgresBackend) aggregateCounts() (int, error) {
 	start := time.Now()
-	tx := s.db.Begin()
+	tx := b.db.Begin()
 
 	var tasks []PostCountsTask
 	if err := tx.Raw("DELETE FROM post_counts_tasks RETURNING *").Scan(&tasks).Error; err != nil {
@@ -510,19 +589,19 @@ func (s *Server) aggregateCounts() (int, error) {
 	return len(tasks), nil
 }
 
-func (s *Server) getOrCreateRepo(ctx context.Context, did string) (*Repo, error) {
-	r, ok := s.repoCache.Get(did)
+func (b *PostgresBackend) getOrCreateRepo(ctx context.Context, did string) (*Repo, error) {
+	r, ok := b.repoCache.Get(did)
 	if !ok {
-		s.reposLk.Lock()
+		b.reposLk.Lock()
 
-		r, ok = s.repoCache.Get(did)
+		r, ok = b.repoCache.Get(did)
 		if !ok {
 			r = &Repo{}
 			r.Did = did
-			s.repoCache.Add(did, r)
+			b.repoCache.Add(did, r)
 		}
 
-		s.reposLk.Unlock()
+		b.reposLk.Unlock()
 	}
 
 	r.Lk.Lock()
@@ -531,7 +610,7 @@ func (s *Server) getOrCreateRepo(ctx context.Context, did string) (*Repo, error)
 		return r, nil
 	}
 
-	if err := s.db.Find(r, "did = ?", did).Error; err != nil {
+	if err := b.db.Find(r, "did = ?", did).Error; err != nil {
 		return nil, err
 	}
 
@@ -542,7 +621,7 @@ func (s *Server) getOrCreateRepo(ctx context.Context, did string) (*Repo, error)
 	}
 
 	r.Did = did
-	if err := s.db.Create(r).Error; err != nil {
+	if err := b.db.Create(r).Error; err != nil {
 		return nil, err
 	}
 
@@ -551,20 +630,20 @@ func (s *Server) getOrCreateRepo(ctx context.Context, did string) (*Repo, error)
 	return r, nil
 }
 
-func (s *Server) getOrCreateList(ctx context.Context, uri string) (*List, error) {
+func (b *PostgresBackend) getOrCreateList(ctx context.Context, uri string) (*List, error) {
 	puri, err := util.ParseAtUri(uri)
 	if err != nil {
 		return nil, err
 	}
 
-	r, err := s.getOrCreateRepo(ctx, puri.Did)
+	r, err := b.getOrCreateRepo(ctx, puri.Did)
 	if err != nil {
 		return nil, err
 	}
 
 	// TODO: needs upsert treatment when we actually find the list
 	var list List
-	if err := s.db.FirstOrCreate(&list, map[string]any{
+	if err := b.db.FirstOrCreate(&list, map[string]any{
 		"author": r.ID,
 		"rkey":   puri.Rkey,
 	}).Error; err != nil {
@@ -578,14 +657,14 @@ type cachedPostInfo struct {
 	Author uint
 }
 
-func (s *Server) postIDForUri(ctx context.Context, uri string) (uint, error) {
-	v, ok := s.postInfoCache.Get(uri)
+func (b *PostgresBackend) postIDForUri(ctx context.Context, uri string) (uint, error) {
+	v, ok := b.postInfoCache.Get(uri)
 	if ok {
 		return v.ID, nil
 	}
 
 	// getPostByUri implicitly fills the cache
-	p, err := s.getPostByUri(ctx, uri)
+	p, err := b.getPostByUri(ctx, uri)
 	if err != nil {
 		return 0, err
 	}
@@ -593,14 +672,14 @@ func (s *Server) postIDForUri(ctx context.Context, uri string) (uint, error) {
 	return p.ID, nil
 }
 
-func (s *Server) postInfoForUri(ctx context.Context, uri string) (*cachedPostInfo, error) {
-	v, ok := s.postInfoCache.Get(uri)
+func (b *PostgresBackend) postInfoForUri(ctx context.Context, uri string) (*cachedPostInfo, error) {
+	v, ok := b.postInfoCache.Get(uri)
 	if ok {
 		return v, nil
 	}
 
 	// getPostByUri implicitly fills the cache
-	p, err := s.getPostByUri(ctx, uri)
+	p, err := b.getPostByUri(ctx, uri)
 	if err != nil {
 		return nil, err
 	}
@@ -608,19 +687,19 @@ func (s *Server) postInfoForUri(ctx context.Context, uri string) (*cachedPostInf
 	return &cachedPostInfo{ID: p.ID, Author: p.Author}, nil
 }
 
-func (s *Server) getPostByUri(ctx context.Context, uri string) (*Post, error) {
+func (b *PostgresBackend) getPostByUri(ctx context.Context, uri string) (*Post, error) {
 	puri, err := util.ParseAtUri(uri)
 	if err != nil {
 		return nil, err
 	}
 
-	r, err := s.getOrCreateRepo(ctx, puri.Did)
+	r, err := b.getOrCreateRepo(ctx, puri.Did)
 	if err != nil {
 		return nil, err
 	}
 
 	var post Post
-	if err := s.db.Find(&post, "author = ? AND rkey = ?", r.ID, puri.Rkey).Error; err != nil {
+	if err := b.db.Find(&post, "author = ? AND rkey = ?", r.ID, puri.Rkey).Error; err != nil {
 		return nil, err
 	}
 
@@ -629,22 +708,22 @@ func (s *Server) getPostByUri(ctx context.Context, uri string) (*Post, error) {
 		post.Author = r.ID
 		post.NotFound = true
 
-		if err := s.db.Session(&gorm.Session{
+		if err := b.db.Session(&gorm.Session{
 			Logger: logger.Default.LogMode(logger.Silent),
 		}).Create(&post).Error; err != nil {
 			if !errors.Is(err, gorm.ErrDuplicatedKey) {
 				return nil, err
 			}
-			if err := s.db.Find(&post, "author = ? AND rkey = ?", r.ID, puri.Rkey).Error; err != nil {
+			if err := b.db.Find(&post, "author = ? AND rkey = ?", r.ID, puri.Rkey).Error; err != nil {
 				return nil, fmt.Errorf("got duplicate post and still couldnt find it: %w", err)
 			}
 		}
-		if err := s.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&PostCounts{Post: post.ID}).Error; err != nil {
+		if err := b.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&PostCounts{Post: post.ID}).Error; err != nil {
 			return nil, err
 		}
 	}
 
-	s.postInfoCache.Add(uri, &cachedPostInfo{
+	b.postInfoCache.Add(uri, &cachedPostInfo{
 		ID:     post.ID,
 		Author: post.Author,
 	})
@@ -652,32 +731,32 @@ func (s *Server) getPostByUri(ctx context.Context, uri string) (*Post, error) {
 	return &post, nil
 }
 
-func (s *Server) revForRepo(rr *Repo) (string, error) {
-	lrev, ok := s.revCache.Get(rr.ID)
+func (b *PostgresBackend) revForRepo(rr *Repo) (string, error) {
+	lrev, ok := b.revCache.Get(rr.ID)
 	if ok {
 		return lrev, nil
 	}
 
 	var rev string
-	if err := s.db.Raw("SELECT rev FROM gorm_db_jobs WHERE repo = ?", rr.Did).Scan(&rev).Error; err != nil {
+	if err := b.db.Raw("SELECT rev FROM gorm_db_jobs WHERE repo = ?", rr.Did).Scan(&rev).Error; err != nil {
 		return "", err
 	}
 
 	if rev != "" {
-		s.revCache.Add(rr.ID, rev)
+		b.revCache.Add(rr.ID, rev)
 	}
 	return rev, nil
 }
 
-func (s *Server) handleCreate(ctx context.Context, repo string, rev string, path string, rec *[]byte, cid *cid.Cid) error {
+func (b *PostgresBackend) HandleCreate(ctx context.Context, repo string, rev string, path string, rec *[]byte, cid *cid.Cid) error {
 	start := time.Now()
 
-	rr, err := s.getOrCreateRepo(ctx, repo)
+	rr, err := b.getOrCreateRepo(ctx, repo)
 	if err != nil {
 		return fmt.Errorf("get user failed: %w", err)
 	}
 
-	lrev, err := s.revForRepo(rr)
+	lrev, err := b.revForRepo(rr)
 	if err != nil {
 		return err
 	}
@@ -690,7 +769,7 @@ func (s *Server) handleCreate(ctx context.Context, repo string, rev string, path
 
 	parts := strings.Split(path, "/")
 	if len(parts) != 2 {
-		return fmt.Errorf("invalid path in handleCreate: %q", path)
+		return fmt.Errorf("invalid path in HandleCreate: %q", path)
 	}
 	col := parts[0]
 	rkey := parts[1]
@@ -705,62 +784,76 @@ func (s *Server) handleCreate(ctx context.Context, repo string, rev string, path
 
 	switch col {
 	case "app.bsky.feed.post":
-		if err := s.handleCreatePost(ctx, rr, rkey, *rec, *cid); err != nil {
+		if err := b.HandleCreatePost(ctx, rr, rkey, *rec, *cid); err != nil {
 			return err
 		}
 	case "app.bsky.feed.like":
-		if err := s.handleCreateLike(ctx, rr, rkey, *rec, *cid); err != nil {
+		if err := b.HandleCreateLike(ctx, rr, rkey, *rec, *cid); err != nil {
 			return err
 		}
 	case "app.bsky.feed.repost":
-		if err := s.handleCreateRepost(ctx, rr, rkey, *rec, *cid); err != nil {
+		if err := b.HandleCreateRepost(ctx, rr, rkey, *rec, *cid); err != nil {
 			return err
 		}
 	case "app.bsky.graph.follow":
-		if err := s.handleCreateFollow(ctx, rr, rkey, *rec, *cid); err != nil {
+		if err := b.HandleCreateFollow(ctx, rr, rkey, *rec, *cid); err != nil {
 			return err
 		}
 	case "app.bsky.graph.block":
-		if err := s.handleCreateBlock(ctx, rr, rkey, *rec, *cid); err != nil {
+		if err := b.HandleCreateBlock(ctx, rr, rkey, *rec, *cid); err != nil {
 			return err
 		}
 	case "app.bsky.graph.list":
-		if err := s.handleCreateList(ctx, rr, rkey, *rec, *cid); err != nil {
+		if err := b.HandleCreateList(ctx, rr, rkey, *rec, *cid); err != nil {
 			return err
 		}
 	case "app.bsky.graph.listitem":
-		if err := s.handleCreateListitem(ctx, rr, rkey, *rec, *cid); err != nil {
+		if err := b.HandleCreateListitem(ctx, rr, rkey, *rec, *cid); err != nil {
 			return err
 		}
 	case "app.bsky.graph.listblock":
-		if err := s.handleCreateListblock(ctx, rr, rkey, *rec, *cid); err != nil {
+		if err := b.HandleCreateListblock(ctx, rr, rkey, *rec, *cid); err != nil {
 			return err
 		}
 	case "app.bsky.actor.profile":
-		if err := s.handleCreateProfile(ctx, rr, rkey, rev, *rec, *cid); err != nil {
+		if err := b.HandleCreateProfile(ctx, rr, rkey, rev, *rec, *cid); err != nil {
 			return err
 		}
 	case "app.bsky.feed.generator":
-		if err := s.handleCreateFeedGenerator(ctx, rr, rkey, *rec, *cid); err != nil {
+		if err := b.HandleCreateFeedGenerator(ctx, rr, rkey, *rec, *cid); err != nil {
 			return err
 		}
 	case "app.bsky.feed.threadgate":
-		if err := s.handleCreateThreadgate(ctx, rr, rkey, *rec, *cid); err != nil {
+		if err := b.HandleCreateThreadgate(ctx, rr, rkey, *rec, *cid); err != nil {
 			return err
 		}
 	case "chat.bsky.actor.declaration":
-		if err := s.handleCreateChatDeclaration(ctx, rr, rkey, *rec, *cid); err != nil {
+		if err := b.HandleCreateChatDeclaration(ctx, rr, rkey, *rec, *cid); err != nil {
 			return err
 		}
 	default:
 		return fmt.Errorf("unrecognized record type: %q", col)
 	}
 
-	s.revCache.Add(rr.ID, rev)
+	b.revCache.Add(rr.ID, rev)
 	return nil
 }
 
-func (s *Server) handleCreatePost(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
+type PostgresBackend struct {
+	db *gorm.DB
+	s  *Server
+
+	bfstore *backfill.Gormstore
+
+	revCache *lru.TwoQueueCache[uint, string]
+
+	repoCache *lru.TwoQueueCache[string, *Repo]
+	reposLk   sync.Mutex
+
+	postInfoCache *lru.TwoQueueCache[string, *cachedPostInfo]
+}
+
+func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
 	var rec bsky.FeedPost
 	if err := rec.UnmarshalCBOR(bytes.NewReader(recb)); err != nil {
 		return err
@@ -784,7 +877,7 @@ func (s *Server) handleCreatePost(ctx context.Context, repo *Repo, rkey string, 
 			return fmt.Errorf("post reply had nil root")
 		}
 
-		pinfo, err := s.postInfoForUri(ctx, rec.Reply.Parent.Uri)
+		pinfo, err := b.postInfoForUri(ctx, rec.Reply.Parent.Uri)
 		if err != nil {
 			return fmt.Errorf("getting reply parent: %w", err)
 		}
@@ -792,7 +885,7 @@ func (s *Server) handleCreatePost(ctx context.Context, repo *Repo, rkey string, 
 		p.ReplyTo = pinfo.ID
 		p.ReplyToUsr = pinfo.Author
 
-		if err := s.db.Create(&PostCountsTask{
+		if err := b.db.Create(&PostCountsTask{
 			Post: pinfo.ID,
 			Op:   "reply",
 			Val:  1,
@@ -800,14 +893,14 @@ func (s *Server) handleCreatePost(ctx context.Context, repo *Repo, rkey string, 
 			return err
 		}
 
-		thread, err := s.postIDForUri(ctx, rec.Reply.Root.Uri)
+		thread, err := b.postIDForUri(ctx, rec.Reply.Root.Uri)
 		if err != nil {
 			return fmt.Errorf("getting thread root: %w", err)
 		}
 
 		p.InThread = thread
 
-		if err := s.db.Create(&PostCountsTask{
+		if err := b.db.Create(&PostCountsTask{
 			Post: thread,
 			Op:   "thread",
 			Val:  1,
@@ -830,14 +923,14 @@ func (s *Server) handleCreatePost(ctx context.Context, repo *Repo, rkey string, 
 		}
 
 		if rpref != "" && strings.Contains(rpref, "app.bsky.feed.post") {
-			rp, err := s.postIDForUri(ctx, rpref)
+			rp, err := b.postIDForUri(ctx, rpref)
 			if err != nil {
 				return fmt.Errorf("getting quote subject: %w", err)
 			}
 
 			p.Reposting = rp
 
-			if err := s.db.Create(&PostCountsTask{
+			if err := b.db.Create(&PostCountsTask{
 				Post: rp,
 				Op:   "quote",
 				Val:  1,
@@ -862,13 +955,13 @@ func (s *Server) handleCreatePost(ctx context.Context, repo *Repo, rkey string, 
 		}
 	}
 
-	if err := s.db.Clauses(clause.OnConflict{
+	if err := b.db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "author"}, {Name: "rkey"}},
 		DoUpdates: clause.AssignmentColumns([]string{"cid", "not_found", "raw", "created", "indexed"}),
 	}).Create(&p).Error; err != nil {
 		return err
 	}
-	if err := s.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&PostCounts{Post: p.ID}).Error; err != nil {
+	if err := b.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&PostCounts{Post: p.ID}).Error; err != nil {
 		return err
 	}
 
@@ -876,13 +969,13 @@ func (s *Server) handleCreatePost(ctx context.Context, repo *Repo, rkey string, 
 		for _, img := range images {
 			img.Post = p.ID
 		}
-		if err := s.db.Create(images).Error; err != nil {
+		if err := b.db.Create(images).Error; err != nil {
 			return err
 		}
 	}
 
 	uri := "at://" + repo.Did + "/app.bsky.feed.post/" + rkey
-	s.postInfoCache.Add(uri, &cachedPostInfo{
+	b.postInfoCache.Add(uri, &cachedPostInfo{
 		ID:     p.ID,
 		Author: p.Author,
 	})
@@ -890,7 +983,7 @@ func (s *Server) handleCreatePost(ctx context.Context, repo *Repo, rkey string, 
 	return nil
 }
 
-func (s *Server) handleCreateLike(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
+func (b *PostgresBackend) HandleCreateLike(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
 	var rec bsky.FeedLike
 	if err := rec.UnmarshalCBOR(bytes.NewReader(recb)); err != nil {
 		return err
@@ -901,19 +994,19 @@ func (s *Server) handleCreateLike(ctx context.Context, repo *Repo, rkey string, 
 		return fmt.Errorf("invalid timestamp: %w", err)
 	}
 
-	pid, err := s.postIDForUri(ctx, rec.Subject.Uri)
+	pid, err := b.postIDForUri(ctx, rec.Subject.Uri)
 	if err != nil {
 		return fmt.Errorf("getting like subject: %w", err)
 	}
 
-	if err := s.db.Exec(`INSERT INTO "likes" ("created","indexed","author","rkey","subject") VALUES (?,?,?,?,?)`, created.Time(), time.Now(), repo.ID, rkey, pid).Error; err != nil {
+	if err := b.db.Exec(`INSERT INTO "likes" ("created","indexed","author","rkey","subject") VALUES (?,?,?,?,?)`, created.Time(), time.Now(), repo.ID, rkey, pid).Error; err != nil {
 		if errors.Is(err, gorm.ErrDuplicatedKey) {
 			return nil
 		}
 		return err
 	}
 
-	if err := s.db.Create(&PostCountsTask{
+	if err := b.db.Create(&PostCountsTask{
 		Post: pid,
 		Op:   "like",
 		Val:  1,
@@ -924,7 +1017,7 @@ func (s *Server) handleCreateLike(ctx context.Context, repo *Repo, rkey string, 
 	return nil
 }
 
-func (s *Server) handleCreateRepost(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
+func (b *PostgresBackend) HandleCreateRepost(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
 	var rec bsky.FeedRepost
 	if err := rec.UnmarshalCBOR(bytes.NewReader(recb)); err != nil {
 		return err
@@ -934,12 +1027,12 @@ func (s *Server) handleCreateRepost(ctx context.Context, repo *Repo, rkey string
 		return fmt.Errorf("invalid timestamp: %w", err)
 	}
 
-	pid, err := s.postIDForUri(ctx, rec.Subject.Uri)
+	pid, err := b.postIDForUri(ctx, rec.Subject.Uri)
 	if err != nil {
 		return fmt.Errorf("getting repost subject: %w", err)
 	}
 
-	if err := s.db.Create(&Repost{
+	if err := b.db.Create(&Repost{
 		Created: created.Time(),
 		Indexed: time.Now(),
 		Author:  repo.ID,
@@ -949,7 +1042,7 @@ func (s *Server) handleCreateRepost(ctx context.Context, repo *Repo, rkey string
 		return err
 	}
 
-	if err := s.db.Create(&PostCountsTask{
+	if err := b.db.Create(&PostCountsTask{
 		Post: pid,
 		Op:   "repost",
 		Val:  1,
@@ -960,7 +1053,7 @@ func (s *Server) handleCreateRepost(ctx context.Context, repo *Repo, rkey string
 	return nil
 }
 
-func (s *Server) handleCreateFollow(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
+func (b *PostgresBackend) HandleCreateFollow(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
 	var rec bsky.GraphFollow
 	if err := rec.UnmarshalCBOR(bytes.NewReader(recb)); err != nil {
 		return err
@@ -970,12 +1063,12 @@ func (s *Server) handleCreateFollow(ctx context.Context, repo *Repo, rkey string
 		return fmt.Errorf("invalid timestamp: %w", err)
 	}
 
-	subj, err := s.getOrCreateRepo(ctx, rec.Subject)
+	subj, err := b.getOrCreateRepo(ctx, rec.Subject)
 	if err != nil {
 		return err
 	}
 
-	if err := s.db.Create(&Follow{
+	if err := b.db.Create(&Follow{
 		Created: created.Time(),
 		Indexed: time.Now(),
 		Author:  repo.ID,
@@ -991,7 +1084,7 @@ func (s *Server) handleCreateFollow(ctx context.Context, repo *Repo, rkey string
 	return nil
 }
 
-func (s *Server) handleCreateBlock(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
+func (b *PostgresBackend) HandleCreateBlock(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
 	var rec bsky.GraphBlock
 	if err := rec.UnmarshalCBOR(bytes.NewReader(recb)); err != nil {
 		return err
@@ -1001,12 +1094,12 @@ func (s *Server) handleCreateBlock(ctx context.Context, repo *Repo, rkey string,
 		return fmt.Errorf("invalid timestamp: %w", err)
 	}
 
-	subj, err := s.getOrCreateRepo(ctx, rec.Subject)
+	subj, err := b.getOrCreateRepo(ctx, rec.Subject)
 	if err != nil {
 		return err
 	}
 
-	if err := s.db.Create(&Block{
+	if err := b.db.Create(&Block{
 		Created: created.Time(),
 		Indexed: time.Now(),
 		Author:  repo.ID,
@@ -1019,7 +1112,7 @@ func (s *Server) handleCreateBlock(ctx context.Context, repo *Repo, rkey string,
 	return nil
 }
 
-func (s *Server) handleCreateList(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
+func (b *PostgresBackend) HandleCreateList(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
 	var rec bsky.GraphList
 	if err := rec.UnmarshalCBOR(bytes.NewReader(recb)); err != nil {
 		return err
@@ -1029,7 +1122,7 @@ func (s *Server) handleCreateList(ctx context.Context, repo *Repo, rkey string, 
 		return fmt.Errorf("invalid timestamp: %w", err)
 	}
 
-	if err := s.db.Create(&List{
+	if err := b.db.Create(&List{
 		Created: created.Time(),
 		Indexed: time.Now(),
 		Author:  repo.ID,
@@ -1042,7 +1135,7 @@ func (s *Server) handleCreateList(ctx context.Context, repo *Repo, rkey string, 
 	return nil
 }
 
-func (s *Server) handleCreateListitem(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
+func (b *PostgresBackend) HandleCreateListitem(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
 	var rec bsky.GraphListitem
 	if err := rec.UnmarshalCBOR(bytes.NewReader(recb)); err != nil {
 		return err
@@ -1052,17 +1145,17 @@ func (s *Server) handleCreateListitem(ctx context.Context, repo *Repo, rkey stri
 		return fmt.Errorf("invalid timestamp: %w", err)
 	}
 
-	subj, err := s.getOrCreateRepo(ctx, rec.Subject)
+	subj, err := b.getOrCreateRepo(ctx, rec.Subject)
 	if err != nil {
 		return err
 	}
 
-	list, err := s.getOrCreateList(ctx, rec.List)
+	list, err := b.getOrCreateList(ctx, rec.List)
 	if err != nil {
 		return err
 	}
 
-	if err := s.db.Create(&ListItem{
+	if err := b.db.Create(&ListItem{
 		Created: created.Time(),
 		Indexed: time.Now(),
 		Author:  repo.ID,
@@ -1076,7 +1169,7 @@ func (s *Server) handleCreateListitem(ctx context.Context, repo *Repo, rkey stri
 	return nil
 }
 
-func (s *Server) handleCreateListblock(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
+func (b *PostgresBackend) HandleCreateListblock(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
 	var rec bsky.GraphListblock
 	if err := rec.UnmarshalCBOR(bytes.NewReader(recb)); err != nil {
 		return err
@@ -1086,12 +1179,12 @@ func (s *Server) handleCreateListblock(ctx context.Context, repo *Repo, rkey str
 		return fmt.Errorf("invalid timestamp: %w", err)
 	}
 
-	list, err := s.getOrCreateList(ctx, rec.Subject)
+	list, err := b.getOrCreateList(ctx, rec.Subject)
 	if err != nil {
 		return err
 	}
 
-	if err := s.db.Create(&ListBlock{
+	if err := b.db.Create(&ListBlock{
 		Created: created.Time(),
 		Indexed: time.Now(),
 		Author:  repo.ID,
@@ -1104,8 +1197,8 @@ func (s *Server) handleCreateListblock(ctx context.Context, repo *Repo, rkey str
 	return nil
 }
 
-func (s *Server) handleCreateProfile(ctx context.Context, repo *Repo, rkey, rev string, recb []byte, cc cid.Cid) error {
-	if err := s.db.Create(&Profile{
+func (b *PostgresBackend) HandleCreateProfile(ctx context.Context, repo *Repo, rkey, rev string, recb []byte, cc cid.Cid) error {
+	if err := b.db.Create(&Profile{
 		//Created: created.Time(),
 		Indexed: time.Now(),
 		Repo:    repo.ID,
@@ -1118,8 +1211,8 @@ func (s *Server) handleCreateProfile(ctx context.Context, repo *Repo, rkey, rev 
 	return nil
 }
 
-func (s *Server) handleUpdateProfile(ctx context.Context, repo *Repo, rkey, rev string, recb []byte, cc cid.Cid) error {
-	if err := s.db.Create(&Profile{
+func (b *PostgresBackend) HandleUpdateProfile(ctx context.Context, repo *Repo, rkey, rev string, recb []byte, cc cid.Cid) error {
+	if err := b.db.Create(&Profile{
 		//Created: created.Time(),
 		Indexed: time.Now(),
 		Repo:    repo.ID,
@@ -1132,7 +1225,7 @@ func (s *Server) handleUpdateProfile(ctx context.Context, repo *Repo, rkey, rev 
 	return nil
 }
 
-func (s *Server) handleCreateFeedGenerator(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
+func (b *PostgresBackend) HandleCreateFeedGenerator(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
 	var rec bsky.FeedGenerator
 	if err := rec.UnmarshalCBOR(bytes.NewReader(recb)); err != nil {
 		return err
@@ -1143,7 +1236,7 @@ func (s *Server) handleCreateFeedGenerator(ctx context.Context, repo *Repo, rkey
 		return fmt.Errorf("invalid timestamp: %w", err)
 	}
 
-	if err := s.db.Create(&FeedGenerator{
+	if err := b.db.Create(&FeedGenerator{
 		Created: created.Time(),
 		Indexed: time.Now(),
 		Author:  repo.ID,
@@ -1156,7 +1249,7 @@ func (s *Server) handleCreateFeedGenerator(ctx context.Context, repo *Repo, rkey
 	return nil
 }
 
-func (s *Server) handleCreateThreadgate(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
+func (b *PostgresBackend) HandleCreateThreadgate(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
 	var rec bsky.FeedThreadgate
 	if err := rec.UnmarshalCBOR(bytes.NewReader(recb)); err != nil {
 		return err
@@ -1167,12 +1260,12 @@ func (s *Server) handleCreateThreadgate(ctx context.Context, repo *Repo, rkey st
 		return fmt.Errorf("invalid timestamp: %w", err)
 	}
 
-	pid, err := s.postIDForUri(ctx, rec.Post)
+	pid, err := b.postIDForUri(ctx, rec.Post)
 	if err != nil {
 		return err
 	}
 
-	if err := s.db.Create(&ThreadGate{
+	if err := b.db.Create(&ThreadGate{
 		Created: created.Time(),
 		Indexed: time.Now(),
 		Author:  repo.ID,
@@ -1185,20 +1278,20 @@ func (s *Server) handleCreateThreadgate(ctx context.Context, repo *Repo, rkey st
 	return nil
 }
 
-func (s *Server) handleCreateChatDeclaration(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
+func (b *PostgresBackend) HandleCreateChatDeclaration(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
 	// TODO: maybe track these?
 	return nil
 }
 
-func (s *Server) handleUpdate(ctx context.Context, repo string, rev string, path string, rec *[]byte, cid *cid.Cid) error {
+func (b *PostgresBackend) HandleUpdate(ctx context.Context, repo string, rev string, path string, rec *[]byte, cid *cid.Cid) error {
 	start := time.Now()
 
-	rr, err := s.getOrCreateRepo(ctx, repo)
+	rr, err := b.getOrCreateRepo(ctx, repo)
 	if err != nil {
 		return fmt.Errorf("get user failed: %w", err)
 	}
 
-	lrev, err := s.revForRepo(rr)
+	lrev, err := b.revForRepo(rr)
 	if err != nil {
 		return err
 	}
@@ -1211,7 +1304,7 @@ func (s *Server) handleUpdate(ctx context.Context, repo string, rev string, path
 
 	parts := strings.Split(path, "/")
 	if len(parts) != 2 {
-		return fmt.Errorf("invalid path in handleCreate: %q", path)
+		return fmt.Errorf("invalid path in HandleCreate: %q", path)
 	}
 	col := parts[0]
 	rkey := parts[1]
@@ -1227,53 +1320,53 @@ func (s *Server) handleUpdate(ctx context.Context, repo string, rev string, path
 	switch col {
 	/*
 		case "app.bsky.feed.post":
-			if err := s.handleCreatePost(ctx, rr, rkey, *rec, *cid); err != nil {
+			if err := s.HandleCreatePost(ctx, rr, rkey, *rec, *cid); err != nil {
 				return err
 			}
 		case "app.bsky.feed.like":
-			if err := s.handleCreateLike(ctx, rr, rkey, *rec, *cid); err != nil {
+			if err := s.HandleCreateLike(ctx, rr, rkey, *rec, *cid); err != nil {
 				return err
 			}
 		case "app.bsky.feed.repost":
-			if err := s.handleCreateRepost(ctx, rr, rkey, *rec, *cid); err != nil {
+			if err := s.HandleCreateRepost(ctx, rr, rkey, *rec, *cid); err != nil {
 				return err
 			}
 		case "app.bsky.graph.follow":
-			if err := s.handleCreateFollow(ctx, rr, rkey, *rec, *cid); err != nil {
+			if err := s.HandleCreateFollow(ctx, rr, rkey, *rec, *cid); err != nil {
 				return err
 			}
 		case "app.bsky.graph.block":
-			if err := s.handleCreateBlock(ctx, rr, rkey, *rec, *cid); err != nil {
+			if err := s.HandleCreateBlock(ctx, rr, rkey, *rec, *cid); err != nil {
 				return err
 			}
 		case "app.bsky.graph.list":
-			if err := s.handleCreateList(ctx, rr, rkey, *rec, *cid); err != nil {
+			if err := s.HandleCreateList(ctx, rr, rkey, *rec, *cid); err != nil {
 				return err
 			}
 		case "app.bsky.graph.listitem":
-			if err := s.handleCreateListitem(ctx, rr, rkey, *rec, *cid); err != nil {
+			if err := s.HandleCreateListitem(ctx, rr, rkey, *rec, *cid); err != nil {
 				return err
 			}
 		case "app.bsky.graph.listblock":
-			if err := s.handleCreateListblock(ctx, rr, rkey, *rec, *cid); err != nil {
+			if err := s.HandleCreateListblock(ctx, rr, rkey, *rec, *cid); err != nil {
 				return err
 			}
 	*/
 	case "app.bsky.actor.profile":
-		if err := s.handleUpdateProfile(ctx, rr, rkey, rev, *rec, *cid); err != nil {
+		if err := b.HandleUpdateProfile(ctx, rr, rkey, rev, *rec, *cid); err != nil {
 			return err
 		}
 		/*
 			case "app.bsky.feed.generator":
-				if err := s.handleCreateFeedGenerator(ctx, rr, rkey, *rec, *cid); err != nil {
+				if err := s.HandleCreateFeedGenerator(ctx, rr, rkey, *rec, *cid); err != nil {
 					return err
 				}
 			case "app.bsky.feed.threadgate":
-				if err := s.handleCreateThreadgate(ctx, rr, rkey, *rec, *cid); err != nil {
+				if err := s.HandleCreateThreadgate(ctx, rr, rkey, *rec, *cid); err != nil {
 					return err
 				}
 			case "chat.bsky.actor.declaration":
-				if err := s.handleCreateChatDeclaration(ctx, rr, rkey, *rec, *cid); err != nil {
+				if err := s.HandleCreateChatDeclaration(ctx, rr, rkey, *rec, *cid); err != nil {
 					return err
 				}
 		*/
@@ -1284,15 +1377,15 @@ func (s *Server) handleUpdate(ctx context.Context, repo string, rev string, path
 	return nil
 }
 
-func (s *Server) handleDelete(ctx context.Context, repo string, rev string, path string) error {
+func (b *PostgresBackend) HandleDelete(ctx context.Context, repo string, rev string, path string) error {
 	start := time.Now()
 
-	rr, err := s.getOrCreateRepo(ctx, repo)
+	rr, err := b.getOrCreateRepo(ctx, repo)
 	if err != nil {
 		return fmt.Errorf("get user failed: %w", err)
 	}
 
-	lrev, ok := s.revCache.Get(rr.ID)
+	lrev, ok := b.revCache.Get(rr.ID)
 	if ok {
 		if rev < lrev {
 			//slog.Info("skipping old rev delete", "did", rr.Did, "rev", rev, "oldrev", lrev)
@@ -1302,7 +1395,7 @@ func (s *Server) handleDelete(ctx context.Context, repo string, rev string, path
 
 	parts := strings.Split(path, "/")
 	if len(parts) != 2 {
-		return fmt.Errorf("invalid path in handleDelete: %q", path)
+		return fmt.Errorf("invalid path in HandleDelete: %q", path)
 	}
 	col := parts[0]
 	rkey := parts[1]
@@ -1313,60 +1406,60 @@ func (s *Server) handleDelete(ctx context.Context, repo string, rev string, path
 
 	switch col {
 	case "app.bsky.feed.post":
-		if err := s.handleDeletePost(ctx, rr, rkey); err != nil {
+		if err := b.HandleDeletePost(ctx, rr, rkey); err != nil {
 			return err
 		}
 	case "app.bsky.feed.like":
-		if err := s.handleDeleteLike(ctx, rr, rkey); err != nil {
+		if err := b.HandleDeleteLike(ctx, rr, rkey); err != nil {
 			return err
 		}
 	case "app.bsky.feed.repost":
-		if err := s.handleDeleteRepost(ctx, rr, rkey); err != nil {
+		if err := b.HandleDeleteRepost(ctx, rr, rkey); err != nil {
 			return err
 		}
 	case "app.bsky.graph.follow":
-		if err := s.handleDeleteFollow(ctx, rr, rkey); err != nil {
+		if err := b.HandleDeleteFollow(ctx, rr, rkey); err != nil {
 			return err
 		}
 	case "app.bsky.graph.block":
-		if err := s.handleDeleteBlock(ctx, rr, rkey); err != nil {
+		if err := b.HandleDeleteBlock(ctx, rr, rkey); err != nil {
 			return err
 		}
 	case "app.bsky.graph.list":
-		if err := s.handleDeleteList(ctx, rr, rkey); err != nil {
+		if err := b.HandleDeleteList(ctx, rr, rkey); err != nil {
 			return err
 		}
 	case "app.bsky.graph.listitem":
-		if err := s.handleDeleteListitem(ctx, rr, rkey); err != nil {
+		if err := b.HandleDeleteListitem(ctx, rr, rkey); err != nil {
 			return err
 		}
 	case "app.bsky.graph.listblock":
-		if err := s.handleDeleteListblock(ctx, rr, rkey); err != nil {
+		if err := b.HandleDeleteListblock(ctx, rr, rkey); err != nil {
 			return err
 		}
 	case "app.bsky.actor.profile":
-		if err := s.handleDeleteProfile(ctx, rr, rkey); err != nil {
+		if err := b.HandleDeleteProfile(ctx, rr, rkey); err != nil {
 			return err
 		}
 	case "app.bsky.feed.generator":
-		if err := s.handleDeleteFeedGenerator(ctx, rr, rkey); err != nil {
+		if err := b.HandleDeleteFeedGenerator(ctx, rr, rkey); err != nil {
 			return err
 		}
 	case "app.bsky.feed.threadgate":
-		if err := s.handleDeleteThreadgate(ctx, rr, rkey); err != nil {
+		if err := b.HandleDeleteThreadgate(ctx, rr, rkey); err != nil {
 			return err
 		}
 	default:
 		return fmt.Errorf("delete unrecognized record type: %q", col)
 	}
 
-	s.revCache.Add(rr.ID, rev)
+	b.revCache.Add(rr.ID, rev)
 	return nil
 }
 
-func (s *Server) handleDeletePost(ctx context.Context, repo *Repo, rkey string) error {
+func (b *PostgresBackend) HandleDeletePost(ctx context.Context, repo *Repo, rkey string) error {
 	var p Post
-	if err := s.db.Find(&p, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
+	if err := b.db.Find(&p, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
 		return err
 	}
 
@@ -1380,14 +1473,14 @@ func (s *Server) handleDeletePost(ctx context.Context, repo *Repo, rkey string) 
 	}
 
 	if rec.Reply != nil && rec.Reply.Parent != nil {
-		reptoid, err := s.postIDForUri(ctx, rec.Reply.Parent.Uri)
+		reptoid, err := b.postIDForUri(ctx, rec.Reply.Parent.Uri)
 		if err != nil {
 			return fmt.Errorf("getting reply parent: %w", err)
 		}
 
 		p.ReplyTo = reptoid
 
-		if err := s.db.Create(&PostCountsTask{
+		if err := b.db.Create(&PostCountsTask{
 			Post: reptoid,
 			Op:   "reply",
 			Val:  -1,
@@ -1395,14 +1488,14 @@ func (s *Server) handleDeletePost(ctx context.Context, repo *Repo, rkey string) 
 			return err
 		}
 
-		thread, err := s.postIDForUri(ctx, rec.Reply.Root.Uri)
+		thread, err := b.postIDForUri(ctx, rec.Reply.Root.Uri)
 		if err != nil {
 			return fmt.Errorf("getting thread root: %w", err)
 		}
 
 		p.InThread = thread
 
-		if err := s.db.Create(&PostCountsTask{
+		if err := b.db.Create(&PostCountsTask{
 			Post: thread,
 			Op:   "thread",
 			Val:  -1,
@@ -1423,14 +1516,14 @@ func (s *Server) handleDeletePost(ctx context.Context, repo *Repo, rkey string) 
 		}
 
 		if rpref != "" && strings.Contains(rpref, "app.bsky.feed.post") {
-			rp, err := s.postIDForUri(ctx, rpref)
+			rp, err := b.postIDForUri(ctx, rpref)
 			if err != nil {
 				return fmt.Errorf("getting quote subject: %w", err)
 			}
 
 			p.Reposting = rp
 
-			if err := s.db.Create(&PostCountsTask{
+			if err := b.db.Create(&PostCountsTask{
 				Post: rp,
 				Op:   "quote",
 				Val:  -1,
@@ -1441,16 +1534,16 @@ func (s *Server) handleDeletePost(ctx context.Context, repo *Repo, rkey string) 
 		}
 	}
 
-	if err := s.db.Delete(&Post{}, p.ID).Error; err != nil {
+	if err := b.db.Delete(&Post{}, p.ID).Error; err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (s *Server) handleDeleteLike(ctx context.Context, repo *Repo, rkey string) error {
+func (b *PostgresBackend) HandleDeleteLike(ctx context.Context, repo *Repo, rkey string) error {
 	var like Like
-	if err := s.db.Find(&like, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
+	if err := b.db.Find(&like, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
 		return err
 	}
 
@@ -1458,11 +1551,11 @@ func (s *Server) handleDeleteLike(ctx context.Context, repo *Repo, rkey string) 
 		return fmt.Errorf("delete of missing like: %s %s", repo.Did, rkey)
 	}
 
-	if err := s.db.Exec("DELETE FROM likes WHERE id = ?", like.ID).Error; err != nil {
+	if err := b.db.Exec("DELETE FROM likes WHERE id = ?", like.ID).Error; err != nil {
 		return err
 	}
 
-	if err := s.db.Create(&PostCountsTask{
+	if err := b.db.Create(&PostCountsTask{
 		Post: like.Subject,
 		Op:   "like",
 		Val:  -1,
@@ -1473,9 +1566,9 @@ func (s *Server) handleDeleteLike(ctx context.Context, repo *Repo, rkey string) 
 	return nil
 }
 
-func (s *Server) handleDeleteRepost(ctx context.Context, repo *Repo, rkey string) error {
+func (b *PostgresBackend) HandleDeleteRepost(ctx context.Context, repo *Repo, rkey string) error {
 	var repost Repost
-	if err := s.db.Find(&repost, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
+	if err := b.db.Find(&repost, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
 		return err
 	}
 
@@ -1483,11 +1576,11 @@ func (s *Server) handleDeleteRepost(ctx context.Context, repo *Repo, rkey string
 		return fmt.Errorf("delete of missing repost: %s %s", repo.Did, rkey)
 	}
 
-	if err := s.db.Exec("DELETE FROM reposts WHERE id = ?", repost.ID).Error; err != nil {
+	if err := b.db.Exec("DELETE FROM reposts WHERE id = ?", repost.ID).Error; err != nil {
 		return err
 	}
 
-	if err := s.db.Create(&PostCountsTask{
+	if err := b.db.Create(&PostCountsTask{
 		Post: repost.Subject,
 		Op:   "repost",
 		Val:  -1,
@@ -1498,9 +1591,9 @@ func (s *Server) handleDeleteRepost(ctx context.Context, repo *Repo, rkey string
 	return nil
 }
 
-func (s *Server) handleDeleteFollow(ctx context.Context, repo *Repo, rkey string) error {
+func (b *PostgresBackend) HandleDeleteFollow(ctx context.Context, repo *Repo, rkey string) error {
 	var follow Follow
-	if err := s.db.Find(&follow, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
+	if err := b.db.Find(&follow, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
 		return err
 	}
 
@@ -1508,16 +1601,16 @@ func (s *Server) handleDeleteFollow(ctx context.Context, repo *Repo, rkey string
 		return fmt.Errorf("delete of missing follow: %s %s", repo.Did, rkey)
 	}
 
-	if err := s.db.Exec("DELETE FROM follows WHERE id = ?", follow.ID).Error; err != nil {
+	if err := b.db.Exec("DELETE FROM follows WHERE id = ?", follow.ID).Error; err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (s *Server) handleDeleteBlock(ctx context.Context, repo *Repo, rkey string) error {
+func (b *PostgresBackend) HandleDeleteBlock(ctx context.Context, repo *Repo, rkey string) error {
 	var block Block
-	if err := s.db.Find(&block, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
+	if err := b.db.Find(&block, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
 		return err
 	}
 
@@ -1525,16 +1618,16 @@ func (s *Server) handleDeleteBlock(ctx context.Context, repo *Repo, rkey string)
 		return fmt.Errorf("delete of missing block: %s %s", repo.Did, rkey)
 	}
 
-	if err := s.db.Exec("DELETE FROM blocks WHERE id = ?", block.ID).Error; err != nil {
+	if err := b.db.Exec("DELETE FROM blocks WHERE id = ?", block.ID).Error; err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (s *Server) handleDeleteList(ctx context.Context, repo *Repo, rkey string) error {
+func (b *PostgresBackend) HandleDeleteList(ctx context.Context, repo *Repo, rkey string) error {
 	var list List
-	if err := s.db.Find(&list, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
+	if err := b.db.Find(&list, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
 		return err
 	}
 
@@ -1542,16 +1635,16 @@ func (s *Server) handleDeleteList(ctx context.Context, repo *Repo, rkey string) 
 		return fmt.Errorf("delete of missing list: %s %s", repo.Did, rkey)
 	}
 
-	if err := s.db.Exec("DELETE FROM lists WHERE id = ?", list.ID).Error; err != nil {
+	if err := b.db.Exec("DELETE FROM lists WHERE id = ?", list.ID).Error; err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (s *Server) handleDeleteListitem(ctx context.Context, repo *Repo, rkey string) error {
+func (b *PostgresBackend) HandleDeleteListitem(ctx context.Context, repo *Repo, rkey string) error {
 	var item ListItem
-	if err := s.db.Find(&item, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
+	if err := b.db.Find(&item, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
 		return err
 	}
 
@@ -1559,16 +1652,16 @@ func (s *Server) handleDeleteListitem(ctx context.Context, repo *Repo, rkey stri
 		return fmt.Errorf("delete of missing listitem: %s %s", repo.Did, rkey)
 	}
 
-	if err := s.db.Exec("DELETE FROM list_items WHERE id = ?", item.ID).Error; err != nil {
+	if err := b.db.Exec("DELETE FROM list_items WHERE id = ?", item.ID).Error; err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (s *Server) handleDeleteListblock(ctx context.Context, repo *Repo, rkey string) error {
+func (b *PostgresBackend) HandleDeleteListblock(ctx context.Context, repo *Repo, rkey string) error {
 	var block ListBlock
-	if err := s.db.Find(&block, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
+	if err := b.db.Find(&block, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
 		return err
 	}
 
@@ -1576,16 +1669,16 @@ func (s *Server) handleDeleteListblock(ctx context.Context, repo *Repo, rkey str
 		return fmt.Errorf("delete of missing listblock: %s %s", repo.Did, rkey)
 	}
 
-	if err := s.db.Exec("DELETE FROM list_blocks WHERE id = ?", block.ID).Error; err != nil {
+	if err := b.db.Exec("DELETE FROM list_blocks WHERE id = ?", block.ID).Error; err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (s *Server) handleDeleteFeedGenerator(ctx context.Context, repo *Repo, rkey string) error {
+func (b *PostgresBackend) HandleDeleteFeedGenerator(ctx context.Context, repo *Repo, rkey string) error {
 	var feedgen FeedGenerator
-	if err := s.db.Find(&feedgen, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
+	if err := b.db.Find(&feedgen, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
 		return err
 	}
 
@@ -1593,16 +1686,16 @@ func (s *Server) handleDeleteFeedGenerator(ctx context.Context, repo *Repo, rkey
 		return fmt.Errorf("delete of missing feedgen: %s %s", repo.Did, rkey)
 	}
 
-	if err := s.db.Exec("DELETE FROM feed_generators WHERE id = ?", feedgen.ID).Error; err != nil {
+	if err := b.db.Exec("DELETE FROM feed_generators WHERE id = ?", feedgen.ID).Error; err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (s *Server) handleDeleteThreadgate(ctx context.Context, repo *Repo, rkey string) error {
+func (b *PostgresBackend) HandleDeleteThreadgate(ctx context.Context, repo *Repo, rkey string) error {
 	var threadgate ThreadGate
-	if err := s.db.Find(&threadgate, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
+	if err := b.db.Find(&threadgate, "author = ? AND rkey = ?", repo.ID, rkey).Error; err != nil {
 		return err
 	}
 
@@ -1610,16 +1703,16 @@ func (s *Server) handleDeleteThreadgate(ctx context.Context, repo *Repo, rkey st
 		return fmt.Errorf("delete of missing threadgate: %s %s", repo.Did, rkey)
 	}
 
-	if err := s.db.Exec("DELETE FROM thread_gates WHERE id = ?", threadgate.ID).Error; err != nil {
+	if err := b.db.Exec("DELETE FROM thread_gates WHERE id = ?", threadgate.ID).Error; err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (s *Server) handleDeleteProfile(ctx context.Context, repo *Repo, rkey string) error {
+func (b *PostgresBackend) HandleDeleteProfile(ctx context.Context, repo *Repo, rkey string) error {
 	var profile Profile
-	if err := s.db.Find(&profile, "repo = ?", repo.ID).Error; err != nil {
+	if err := b.db.Find(&profile, "repo = ?", repo.ID).Error; err != nil {
 		return err
 	}
 
@@ -1627,7 +1720,7 @@ func (s *Server) handleDeleteProfile(ctx context.Context, repo *Repo, rkey strin
 		return fmt.Errorf("delete of missing profile: %s %s", repo.Did, rkey)
 	}
 
-	if err := s.db.Exec("DELETE FROM profiles WHERE id = ?", profile.ID).Error; err != nil {
+	if err := b.db.Exec("DELETE FROM profiles WHERE id = ?", profile.ID).Error; err != nil {
 		return err
 	}
 
@@ -1635,9 +1728,10 @@ func (s *Server) handleDeleteProfile(ctx context.Context, repo *Repo, rkey strin
 }
 
 func (s *Server) imageFetcher() {
+	b := s.backend.(*PostgresBackend)
 	for {
 		var images []Image
-		if err := s.db.Limit(1000).Order("id DESC").Find(&images, "NOT cached AND NOT failed").Error; err != nil {
+		if err := b.db.Limit(1000).Order("id DESC").Find(&images, "NOT cached AND NOT failed").Error; err != nil {
 			slog.Error("checking for images to cache failed", "err", err)
 			time.Sleep(time.Second)
 			continue
@@ -1654,7 +1748,7 @@ func (s *Server) imageFetcher() {
 
 		success := s.batchCacheImages(s.imageCacheDir, uris)
 
-		if err := s.db.Transaction(func(tx *gorm.DB) error {
+		if err := b.db.Transaction(func(tx *gorm.DB) error {
 			for i := range images {
 				if success[i] {
 					if err := tx.Model(Image{}).Where("id = ?", images[i].ID).Update("cached", true).Error; err != nil {
@@ -1677,9 +1771,9 @@ func (s *Server) imageFetcher() {
 	}
 }
 
-func (s *Server) getPostAuthorDid(p uint) (string, error) {
+func (b *PostgresBackend) getPostAuthorDid(p uint) (string, error) {
 	var did string
-	if err := s.db.Raw("SELECT did FROM posts LEFT JOIN repos ON repos.id = posts.author WHERE posts.id = ?", p).Scan(&did).Error; err != nil {
+	if err := b.db.Raw("SELECT did FROM posts LEFT JOIN repos ON repos.id = posts.author WHERE posts.id = ?", p).Scan(&did).Error; err != nil {
 		return "", err
 	}
 
@@ -1889,6 +1983,8 @@ func (s *Server) getImageFromCache(did, cc string, w io.Writer, doresize bool) e
 }
 
 func (s *Server) handleServeImage(w http.ResponseWriter, r *http.Request) {
+	b := s.backend.(*PostgresBackend)
+
 	parts := strings.Split(r.URL.Path, "/")
 	did := parts[len(parts)-2]
 	cc := parts[len(parts)-1]
@@ -1901,7 +1997,7 @@ func (s *Server) handleServeImage(w http.ResponseWriter, r *http.Request) {
 	fmt.Printf("SERVING IMAGE: %q %q (resize=%v)\n", did, cc, doresize)
 
 	var img Image
-	if err := s.db.Find(&img, "cid = ? AND did = ?", cc, did).Error; err != nil {
+	if err := b.db.Find(&img, "cid = ? AND did = ?", cc, did).Error; err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -1925,8 +2021,10 @@ func (s *Server) handleServeImage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) crawlOldPostsForPictures() error {
+	b := s.backend.(*PostgresBackend)
+
 	var oldestImage Image
-	if err := s.db.Raw(`SELECT * FROM images ORDER BY post ASC LIMIT 1`).Scan(&oldestImage).Error; err != nil {
+	if err := b.db.Raw(`SELECT * FROM images ORDER BY post ASC LIMIT 1`).Scan(&oldestImage).Error; err != nil {
 		return fmt.Errorf("failed to find oldest image: %w", err)
 	}
 
@@ -1938,7 +2036,7 @@ func (s *Server) crawlOldPostsForPictures() error {
 
 	for maxpost > 0 {
 		var postsToCheck []Post
-		if err := s.db.Raw(`SELECT * FROM posts WHERE id < ? AND NOT not_found ORDER BY id DESC LIMIT 200`, maxpost).Scan(&postsToCheck).Error; err != nil {
+		if err := b.db.Raw(`SELECT * FROM posts WHERE id < ? AND NOT not_found ORDER BY id DESC LIMIT 200`, maxpost).Scan(&postsToCheck).Error; err != nil {
 			return fmt.Errorf("getting more posts to check: %w", err)
 		}
 		if len(postsToCheck) == 0 {
@@ -1958,6 +2056,8 @@ func (s *Server) crawlOldPostsForPictures() error {
 }
 
 func (s *Server) indexImagesInPost(p *Post) error {
+	b := s.backend.(*PostgresBackend)
+
 	var fp bsky.FeedPost
 
 	if err := fp.UnmarshalCBOR(bytes.NewReader(p.Raw)); err != nil {
@@ -1969,7 +2069,7 @@ func (s *Server) indexImagesInPost(p *Post) error {
 	}
 
 	var did string
-	if err := s.db.Raw("SELECT did FROM repos WHERE id = ?", p.Author).Scan(&did).Error; err != nil {
+	if err := b.db.Raw("SELECT did FROM repos WHERE id = ?", p.Author).Scan(&did).Error; err != nil {
 		return err
 	}
 
@@ -1988,7 +2088,7 @@ func (s *Server) indexImagesInPost(p *Post) error {
 	}
 
 	if len(images) > 0 {
-		if err := s.db.Create(images).Error; err != nil {
+		if err := b.db.Create(images).Error; err != nil {
 			return err
 		}
 	}
