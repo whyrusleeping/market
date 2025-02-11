@@ -373,6 +373,11 @@ func parseCreatedFromRecord(rec any, rkey string) (time.Time, error) {
 		}
 
 		return parseTimestamp(*rec.CreatedAt)
+	case *bsky.FeedGenerator:
+		if !rkeyTime.IsZero() {
+			return rkeyTime, nil
+		}
+		return time.Now(), nil
 	default:
 		if rkeyTime.IsZero() {
 			return time.Time{}, fmt.Errorf("failed to get a useful timestamp from record")
