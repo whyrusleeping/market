@@ -245,9 +245,7 @@ func main() {
 			case <-streamClosed:
 			}
 
-			// REMOVEME
-			close(quit)
-			return
+			s.con.Close()
 
 			bf.Stop(context.TODO())
 
