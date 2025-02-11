@@ -117,7 +117,7 @@ func (b *BigQueryBackend) HandleCreate(ctx context.Context, repo string, rev str
 
 	switch col {
 	case "app.bsky.feed.post":
-		if err := b.HandleCreatePost(ctx, repo, rkey, *rec, *cid); err != nil {
+		if err := b.HandleCreatePost(ctx, repo, rkey, rev, *rec, *cid); err != nil {
 			return err
 		}
 	case "app.bsky.feed.like":
@@ -141,7 +141,7 @@ func (b *BigQueryBackend) HandleCreate(ctx context.Context, repo string, rev str
 	return nil
 }
 
-func (b *BigQueryBackend) HandleCreatePost(ctx context.Context, repo string, rkey string, recb []byte, cc cid.Cid) error {
+func (b *BigQueryBackend) HandleCreatePost(ctx context.Context, repo string, rkey string, rev string, recb []byte, cc cid.Cid) error {
 	var rec bsky.FeedPost
 	if err := rec.UnmarshalCBOR(bytes.NewReader(recb)); err != nil {
 		return err
@@ -167,6 +167,7 @@ func (b *BigQueryBackend) HandleCreatePost(ctx context.Context, repo string, rke
 		Raw:        recb,
 		Json:       string(jsonb),
 		Cid:        cc.String(),
+		Rev:        rev,
 	}
 
 	if rec.Reply != nil && rec.Reply.Parent != nil {
@@ -402,7 +403,11 @@ func (b *BigQueryBackend) HandleCreateGeneric(ctx context.Context, repo, collect
 		return err
 	}
 
+	uri := recordUri(repo, collection, rkey)
+
 	profile := &BQRecord{
+		ID:         uri,
+		Rkey:       rkey,
 		AuthorDID:  repo,
 		Collection: collection,
 		Created:    created,
