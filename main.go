@@ -101,6 +101,7 @@ func main() {
 
 		db.AutoMigrate(backfill.GormDBJob{})
 		db.AutoMigrate(cursorRecord{})
+		db.AutoMigrate(MarketConfig{})
 
 		useBigQuery := cctx.Bool("enable-bigquery-backend")
 
@@ -135,7 +136,6 @@ func main() {
 
 			bend = bqb
 		} else {
-			panic("not doing this")
 			db.AutoMigrate(Repo{})
 			db.AutoMigrate(Post{})
 			db.AutoMigrate(PostCounts{})
@@ -150,7 +150,6 @@ func main() {
 			db.AutoMigrate(Profile{})
 			db.AutoMigrate(ThreadGate{})
 			db.AutoMigrate(FeedGenerator{})
-			db.AutoMigrate(MarketConfig{})
 			db.AutoMigrate(Image{})
 
 			rc, _ := lru.New2Q[string, *Repo](1_000_000)
