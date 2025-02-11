@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,8 @@ import (
 	lexutil "github.com/bluesky-social/indigo/lex/util"
 	"github.com/ipfs/go-cid"
 )
+
+var plog = slog.Default()
 
 // BigQueryBackend Handles interactions with BigQuery
 type BigQueryBackend struct {
@@ -345,10 +348,10 @@ func parseCreatedFromRecord(rec any, rkey string) (time.Time, error) {
 	if rkey != "self" {
 		rt, err := syntax.ParseTID(rkey)
 		if err != nil {
-			return time.Time{}, err
+			plog.Warn("failed to parse rkey for record into timestamp", "rkey", rkey, "error", err)
+		} else {
+			rkeyTime = rt.Time()
 		}
-
-		rkeyTime = rt.Time()
 	}
 
 	switch rec := rec.(type) {
