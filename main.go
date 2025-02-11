@@ -73,13 +73,16 @@ func main() {
 			Name: "image-cache-server",
 		},
 		&cli.BoolFlag{
-			Name: "enable-biqquery-backend",
+			Name: "enable-bigquery-backend",
 		},
 		&cli.StringFlag{
 			Name: "bigquery-auth",
 		},
 		&cli.StringFlag{
-			Name: "biqquery-project",
+			Name: "bigquery-project",
+		},
+		&cli.StringFlag{
+			Name: "bigquery-dataset",
 		},
 	}
 	app.Action = func(cctx *cli.Context) error {
@@ -99,7 +102,7 @@ func main() {
 		db.AutoMigrate(backfill.GormDBJob{})
 		db.AutoMigrate(cursorRecord{})
 
-		useBigQuery := cctx.Bool("enable-biqquery-backend")
+		useBigQuery := cctx.Bool("enable-bigquery-backend")
 
 		gstore := backfill.NewGormstore(db)
 
@@ -121,9 +124,6 @@ func main() {
 
 			dataset := client.Dataset(datasetID)
 
-			rc, _ := lru.New2Q[string, *Repo](1_000_000)
-			pc, _ := lru.New2Q[string, *cachedPostInfo](5_000_000)
-
 			bqb := &BigQueryBackend{
 				bfstore: gstore,
 
@@ -131,12 +131,11 @@ func main() {
 				dataset:   dataset,
 				projectID: projectID,
 				datasetID: datasetID,
-				postCache: pc,
-				repoCache: rc,
 			}
 
 			bend = bqb
 		} else {
+			panic("not doing this")
 			db.AutoMigrate(Repo{})
 			db.AutoMigrate(Post{})
 			db.AutoMigrate(PostCounts{})
@@ -174,6 +173,7 @@ func main() {
 			backend:          bend,
 			imageCacheDir:    cctx.String("image-dir"),
 			imageCacheServer: cctx.String("image-cache-server"),
+			bfdb:             db,
 		}
 
 		curs, err := s.LoadCursor(context.TODO())
@@ -183,7 +183,9 @@ func main() {
 
 		go s.syncCursorRoutine()
 
-		go s.imageFetcher()
+		if !useBigQuery {
+			go s.imageFetcher()
+		}
 
 		ctx := context.TODO()
 		if err := gstore.LoadJobs(ctx); err != nil {
@@ -243,6 +245,10 @@ func main() {
 			case <-streamClosed:
 			}
 
+			// REMOVEME
+			close(quit)
+			return
+
 			bf.Stop(context.TODO())
 
 			// Shutdown the ingester.
@@ -279,22 +285,24 @@ type Backend interface {
 	HandleUpdate(ctx context.Context, repo string, rev string, path string, rec *[]byte, cid *cid.Cid) error
 	HandleDelete(ctx context.Context, repo string, rev string, path string) error
 
-	// Create handlers
-	HandleCreatePost(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error
-	HandleCreateLike(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error
-	HandleCreateRepost(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error
-	HandleCreateFollow(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error
-	HandleCreateProfile(ctx context.Context, repo *Repo, rkey string, rev string, recb []byte, cc cid.Cid) error
+	/*
+		// Create handlers
+		HandleCreatePost(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error
+		HandleCreateLike(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error
+		HandleCreateRepost(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error
+		HandleCreateFollow(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error
+		HandleCreateProfile(ctx context.Context, repo *Repo, rkey string, rev string, recb []byte, cc cid.Cid) error
 
-	// Delete handlers
-	HandleDeletePost(ctx context.Context, repo *Repo, rkey string) error
-	HandleDeleteLike(ctx context.Context, repo *Repo, rkey string) error
-	HandleDeleteRepost(ctx context.Context, repo *Repo, rkey string) error
-	HandleDeleteFollow(ctx context.Context, repo *Repo, rkey string) error
-	HandleDeleteProfile(ctx context.Context, repo *Repo, rkey string) error
+		// Delete handlers
+		HandleDeletePost(ctx context.Context, repo *Repo, rkey string) error
+		HandleDeleteLike(ctx context.Context, repo *Repo, rkey string) error
+		HandleDeleteRepost(ctx context.Context, repo *Repo, rkey string) error
+		HandleDeleteFollow(ctx context.Context, repo *Repo, rkey string) error
+		HandleDeleteProfile(ctx context.Context, repo *Repo, rkey string) error
 
-	// Update handlers
-	HandleUpdateProfile(ctx context.Context, repo *Repo, rkey string, rev string, recb []byte, cc cid.Cid) error
+		// Update handlers
+		HandleUpdateProfile(ctx context.Context, repo *Repo, rkey string, rev string, recb []byte, cc cid.Cid) error
+	*/
 }
 
 type Server struct {
