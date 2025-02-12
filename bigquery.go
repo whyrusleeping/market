@@ -49,23 +49,12 @@ func NewBigQueryBackend(client *bigquery.Client, projectID, datasetID string, st
 		datasetID: datasetID,
 	}
 
-	inserter := dataset.Table("interactions").Inserter()
-	inserter.SkipInvalidRows = true
-	bqb.interactionBatcher = &bqBatcher[*BQInteraction]{
-		inserter: inserter,
-	}
+	bqb.interactionBatcher = NewBqBatcher[*BQInteraction](dataset.Table("interactions").Inserter())
+	bqb.followsBatcher = NewBqBatcher[*BQFollow](dataset.Table("follows").Inserter())
+	bqb.recordBatcher = NewBqBatcher[*BQRecord](dataset.Table("records").Inserter())
 
-	fins := dataset.Table("follows").Inserter()
-	fins.SkipInvalidRows = true
-	bqb.followsBatcher = &bqBatcher[*BQFollow]{
-		inserter: fins,
-	}
-
-	rins := dataset.Table("records").Inserter()
-	rins.SkipInvalidRows = true
-	bqb.recordBatcher = &bqBatcher[*BQRecord]{
-		inserter: rins,
-	}
+	bqb.interactionBatcher.batchSize = 3000
+	bqb.followsBatcher.batchSize = 1500
 
 	return bqb
 }
@@ -648,8 +637,39 @@ type bqBatcher[T any] struct {
 	lk  sync.Mutex
 	buf []T
 
-	client   *bigquery.Client
+	batchSize int
+
 	inserter *bigquery.Inserter
+
+	batches chan []T
+
+	wg sync.WaitGroup
+}
+
+func NewBqBatcher[T any](ins *bigquery.Inserter) *bqBatcher[T] {
+	ins.SkipInvalidRows = true
+
+	bb := &bqBatcher[T]{
+		inserter:  ins,
+		batches:   make(chan []T),
+		batchSize: 1000,
+	}
+
+	for i := 0; i < 3; i++ {
+		bb.wg.Add(1)
+		go bb.runWorker()
+	}
+
+	return bb
+}
+
+func (b *bqBatcher[T]) runWorker() {
+	defer b.wg.Done()
+	for batch := range b.batches {
+		if err := b.inserter.Put(context.Background(), batch); err != nil {
+			plog.Error("failed to write batch to bigquery", "size", len(batch), "error", err)
+		}
+	}
 }
 
 func (b *bqBatcher[T]) Put(ctx context.Context, obj T) error {
@@ -657,12 +677,10 @@ func (b *bqBatcher[T]) Put(ctx context.Context, obj T) error {
 	defer b.lk.Unlock()
 	b.buf = append(b.buf, obj)
 
-	if len(b.buf) > 1000 {
+	if len(b.buf) > b.batchSize {
 		tosend := b.buf
+		b.batches <- tosend
 		b.buf = b.buf[:0]
-		if err := b.inserter.Put(ctx, tosend); err != nil {
-			return err
-		}
 	}
 
 	return nil
@@ -672,11 +690,13 @@ func (b *bqBatcher[T]) Flush(ctx context.Context) error {
 	b.lk.Lock()
 	defer b.lk.Unlock()
 
+	close(b.batches)
 	if err := b.inserter.Put(ctx, b.buf); err != nil {
 		return err
 	}
 	b.buf = b.buf[:0]
 
-	return nil
+	b.wg.Wait()
 
+	return nil
 }
