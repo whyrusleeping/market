@@ -71,6 +71,10 @@ func main() {
 			Name:  "max-db-connections",
 			Value: 50,
 		},
+		&cli.IntFlag{
+			Name:  "backfill-workers",
+			Value: 50,
+		},
 		&cli.StringFlag{
 			Name: "image-cache-server",
 		},
@@ -206,7 +210,7 @@ func main() {
 
 		opts := backfill.DefaultBackfillOptions()
 		opts.SyncRequestsPerSecond = 30
-		opts.ParallelBackfills = 30
+		opts.ParallelBackfills = cctx.Int("backfill-workers")
 
 		bf := backfill.NewBackfiller("market", gstore, s.backend.HandleCreate, s.backend.HandleUpdate, s.backend.HandleDelete, opts)
 		s.bf = bf
