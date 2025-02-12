@@ -192,8 +192,8 @@ func main() {
 		}
 
 		opts := backfill.DefaultBackfillOptions()
-		opts.SyncRequestsPerSecond = 20
-		opts.ParallelBackfills = 50
+		opts.SyncRequestsPerSecond = 30
+		opts.ParallelBackfills = 30
 
 		bf := backfill.NewBackfiller("market", gstore, s.backend.HandleCreate, s.backend.HandleUpdate, s.backend.HandleDelete, opts)
 		s.bf = bf
