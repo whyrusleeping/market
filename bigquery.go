@@ -28,6 +28,7 @@ type BigQueryBackend struct {
 
 	interactionBatcher *bqBatcher[*BQInteraction]
 	followsBatcher     *bqBatcher[*BQFollow]
+	recordBatcher      *bqBatcher[*BQRecord]
 
 	client    *bigquery.Client
 	dataset   *bigquery.Dataset
@@ -58,6 +59,12 @@ func NewBigQueryBackend(client *bigquery.Client, projectID, datasetID string, st
 	fins.SkipInvalidRows = true
 	bqb.followsBatcher = &bqBatcher[*BQFollow]{
 		inserter: fins,
+	}
+
+	rins := dataset.Table("records").Inserter()
+	rins.SkipInvalidRows = true
+	bqb.recordBatcher = &bqBatcher[*BQRecord]{
+		inserter: rins,
 	}
 
 	return bqb
@@ -248,8 +255,7 @@ func (b *BigQueryBackend) HandleCreatePost(ctx context.Context, repo string, rke
 		}
 	}
 
-	inserter := b.dataset.Table("records").Inserter()
-	if err := inserter.Put(ctx, post); err != nil {
+	if err := b.recordBatcher.Put(ctx, post); err != nil {
 		return fmt.Errorf("failed to insert post: %w", err)
 	}
 
@@ -446,8 +452,7 @@ func (b *BigQueryBackend) HandleCreateGeneric(ctx context.Context, repo, collect
 		Cid:        cc.String(),
 	}
 
-	inserter := b.dataset.Table("records").Inserter()
-	if err := inserter.Put(ctx, profile); err != nil {
+	if err := b.recordBatcher.Put(ctx, profile); err != nil {
 		return fmt.Errorf("failed to insert record: %w", err)
 	}
 
