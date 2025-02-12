@@ -118,7 +118,16 @@ func main() {
 			projectID := cctx.String("bigquery-project")
 			datasetID := cctx.String("bigquery-dataset")
 
-			client, err := bigquery.NewClient(context.TODO(), projectID, option.WithCredentialsFile(auth))
+			transport := &http.Transport{
+				DisableCompression: true,
+			}
+
+			client, err := bigquery.NewClient(context.TODO(), projectID,
+				option.WithCredentialsFile(auth),
+				option.WithHTTPClient(&http.Client{
+					Transport: transport,
+				}),
+			)
 			if err != nil {
 				return err
 			}

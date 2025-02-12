@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -17,6 +16,8 @@ import (
 	"github.com/bluesky-social/indigo/backfill"
 	lexutil "github.com/bluesky-social/indigo/lex/util"
 	"github.com/ipfs/go-cid"
+
+	fjson "github.com/goccy/go-json"
 )
 
 var plog = slog.Default()
@@ -182,7 +183,7 @@ func (b *BigQueryBackend) HandleCreatePost(ctx context.Context, repo string, rke
 		return fmt.Errorf("invalid timestamp: %w", err)
 	}
 
-	jsonb, err := json.Marshal(rec)
+	jsonb, err := fjson.Marshal(rec)
 	if err != nil {
 		return err
 	}
@@ -420,7 +421,7 @@ func (b *BigQueryBackend) HandleCreateGeneric(ctx context.Context, repo, collect
 		return err
 	}
 
-	jsonb, err := json.Marshal(val)
+	jsonb, err := fjson.Marshal(val)
 	if err != nil {
 		return err
 	}
@@ -462,7 +463,7 @@ func (b *BigQueryBackend) HandleUpdateGeneric(ctx context.Context, repo, collect
 		return err
 	}
 
-	jsonb, err := json.Marshal(val)
+	jsonb, err := fjson.Marshal(val)
 	if err != nil {
 		return err
 	}
