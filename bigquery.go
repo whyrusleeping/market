@@ -26,6 +26,7 @@ type BigQueryBackend struct {
 	bfstore *backfill.Gormstore
 
 	interactionBatcher *bqBatcher[*BQInteraction]
+	followsBatcher     *bqBatcher[*BQFollow]
 
 	client    *bigquery.Client
 	dataset   *bigquery.Dataset
@@ -50,6 +51,12 @@ func NewBigQueryBackend(client *bigquery.Client, projectID, datasetID string, st
 	inserter.SkipInvalidRows = true
 	bqb.interactionBatcher = &bqBatcher[*BQInteraction]{
 		inserter: inserter,
+	}
+
+	fins := dataset.Table("follows").Inserter()
+	fins.SkipInvalidRows = true
+	bqb.followsBatcher = &bqBatcher[*BQFollow]{
+		inserter: fins,
 	}
 
 	return bqb
@@ -328,8 +335,7 @@ func (b *BigQueryBackend) HandleCreateFollow(ctx context.Context, repo string, r
 		SubjectDID: rec.Subject,
 	}
 
-	inserter := b.dataset.Table("follows").Inserter()
-	if err := inserter.Put(ctx, follow); err != nil {
+	if err := b.followsBatcher.Put(ctx, follow); err != nil {
 		return fmt.Errorf("failed to insert follow: %w", err)
 	}
 
@@ -442,113 +448,6 @@ func (b *BigQueryBackend) HandleCreateGeneric(ctx context.Context, repo, collect
 	inserter := b.dataset.Table("records").Inserter()
 	if err := inserter.Put(ctx, profile); err != nil {
 		return fmt.Errorf("failed to insert record: %w", err)
-	}
-
-	return nil
-}
-
-// Delete Handlers
-
-func (b *BigQueryBackend) HandleDeleteRecord(ctx context.Context, repo, collection, rkey string) error {
-	postID := postUri(repo, rkey)
-
-	// Delete the post itself using DML
-	deleteQuery := fmt.Sprintf("DELETE FROM %s.records WHERE id = @post_id", b.datasetID)
-	q := b.client.Query(deleteQuery)
-	q.Parameters = []bigquery.QueryParameter{
-		{Name: "post_id", Value: postID},
-	}
-
-	job, err := q.Run(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to run delete query: %w", err)
-	}
-
-	status, err := job.Wait(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to wait for delete job: %w", err)
-	}
-
-	if status.Err() != nil {
-		return fmt.Errorf("delete job failed: %w", status.Err())
-	}
-
-	return nil
-}
-
-func (b *BigQueryBackend) HandleDeleteInteraction(ctx context.Context, repo, col, rkey string) error {
-	id := recordUri(repo, col, rkey)
-
-	// Delete the like
-	deleteQuery := fmt.Sprintf("DELETE FROM %s.interactions WHERE id = @rec_id", b.datasetID)
-	q := b.client.Query(deleteQuery)
-	q.Parameters = []bigquery.QueryParameter{
-		{Name: "rec_id", Value: id},
-	}
-
-	job, err := q.Run(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to run delete query: %w", err)
-	}
-
-	status, err := job.Wait(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to wait for delete job: %w", err)
-	}
-
-	if status.Err() != nil {
-		return fmt.Errorf("delete job failed: %w", status.Err())
-	}
-
-	return nil
-}
-
-func (b *BigQueryBackend) HandleDeleteFollow(ctx context.Context, repo string, rkey string) error {
-	followID := followUri(repo, rkey)
-
-	deleteQuery := fmt.Sprintf("DELETE FROM %s.follows WHERE id = @follow_id", b.datasetID)
-	q := b.client.Query(deleteQuery)
-	q.Parameters = []bigquery.QueryParameter{
-		{Name: "follow_id", Value: followID},
-	}
-
-	job, err := q.Run(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to run delete query: %w", err)
-	}
-
-	status, err := job.Wait(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to wait for delete job: %w", err)
-	}
-
-	if status.Err() != nil {
-		return fmt.Errorf("delete job failed: %w", status.Err())
-	}
-
-	return nil
-}
-
-func (b *BigQueryBackend) HandleDeleteGeneric(ctx context.Context, repo, collection, rkey string) error {
-	uri := recordUri(repo, collection, rkey)
-	deleteQuery := fmt.Sprintf("DELETE FROM %s.records WHERE id = @uri", b.datasetID)
-	q := b.client.Query(deleteQuery)
-	q.Parameters = []bigquery.QueryParameter{
-		{Name: "uri", Value: uri},
-	}
-
-	job, err := q.Run(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to run delete query: %w", err)
-	}
-
-	status, err := job.Wait(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to wait for delete job: %w", err)
-	}
-
-	if status.Err() != nil {
-		return fmt.Errorf("delete job failed: %w", status.Err())
 	}
 
 	return nil
@@ -697,6 +596,18 @@ func (b *BigQueryBackend) revForRepo(repo string) (string, error) {
 	return job.Rev(), nil
 }
 
+func (b *BigQueryBackend) Flush(ctx context.Context) error {
+	if err := b.followsBatcher.Flush(ctx); err != nil {
+		return err
+	}
+
+	if err := b.interactionBatcher.Flush(ctx); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 type bqBatcher[T any] struct {
 	lk  sync.Mutex
 	buf []T
@@ -718,4 +629,17 @@ func (b *bqBatcher[T]) Put(ctx context.Context, obj T) error {
 	}
 
 	return nil
+}
+
+func (b *bqBatcher[T]) Flush(ctx context.Context) error {
+	b.lk.Lock()
+	defer b.lk.Unlock()
+
+	if err := b.inserter.Put(ctx, b.buf); err != nil {
+		return err
+	}
+	b.buf = b.buf[:0]
+
+	return nil
+
 }

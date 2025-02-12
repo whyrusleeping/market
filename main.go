@@ -260,7 +260,7 @@ func main() {
 
 		<-quit
 
-		return nil
+		return bend.Flush(ctx)
 	}
 
 	app.RunAndExitOnError()
@@ -270,6 +270,8 @@ type Backend interface {
 	HandleCreate(ctx context.Context, repo string, rev string, path string, rec *[]byte, cid *cid.Cid) error
 	HandleUpdate(ctx context.Context, repo string, rev string, path string, rec *[]byte, cid *cid.Cid) error
 	HandleDelete(ctx context.Context, repo string, rev string, path string) error
+
+	Flush(ctx context.Context) error
 
 	/*
 		// Create handlers
@@ -845,6 +847,10 @@ type PostgresBackend struct {
 	reposLk   sync.Mutex
 
 	postInfoCache *lru.TwoQueueCache[string, *cachedPostInfo]
+}
+
+func (b *PostgresBackend) Flush(ctx context.Context) error {
+	return nil
 }
 
 func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
