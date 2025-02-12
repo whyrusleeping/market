@@ -39,6 +39,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/urfave/cli/v2"
 	. "github.com/whyrusleeping/market/models"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 	"google.golang.org/api/option"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -115,17 +117,30 @@ func main() {
 				return fmt.Errorf("must specify bigquery-auth")
 			}
 
+			credBytes, err := os.ReadFile(auth)
+			if err != nil {
+				return err
+			}
+
+			creds, err := google.CredentialsFromJSON(context.TODO(), credBytes, bigquery.Scope)
+			if err != nil {
+				return fmt.Errorf("failed to load credentials: %w", err)
+			}
+
 			projectID := cctx.String("bigquery-project")
 			datasetID := cctx.String("bigquery-dataset")
 
-			transport := &http.Transport{
-				DisableCompression: true,
+			transport := oauth2.Transport{
+				Base: &http.Transport{
+					DisableCompression: true,
+				},
+				Source: creds.TokenSource,
 			}
 
 			client, err := bigquery.NewClient(context.TODO(), projectID,
 				option.WithCredentialsFile(auth),
 				option.WithHTTPClient(&http.Client{
-					Transport: transport,
+					Transport: &transport,
 				}),
 			)
 			if err != nil {
