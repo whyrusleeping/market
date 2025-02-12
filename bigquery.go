@@ -185,9 +185,9 @@ func (b *BigQueryBackend) HandleCreatePost(ctx context.Context, repo string, rke
 		return err
 	}
 
-	created, err := syntax.ParseDatetimeLenient(rec.CreatedAt)
+	created, err := parseCreatedFromRecord(rec, rkey)
 	if err != nil {
-		return fmt.Errorf("invalid timestamp: %w", err)
+		return err
 	}
 
 	jsonb, err := fjson.Marshal(rec)
@@ -200,7 +200,7 @@ func (b *BigQueryBackend) HandleCreatePost(ctx context.Context, repo string, rke
 		Collection: "app.bsky.feed.post",
 		AuthorDID:  repo,
 		Rkey:       rkey,
-		Created:    created.Time(),
+		Created:    created,
 		Indexed:    time.Now(),
 		Raw:        recb,
 		Json:       string(jsonb),
@@ -298,9 +298,9 @@ func (b *BigQueryBackend) HandleCreateRepost(ctx context.Context, repo string, r
 		return err
 	}
 
-	created, err := syntax.ParseDatetimeLenient(rec.CreatedAt)
+	created, err := parseCreatedFromRecord(rec, rkey)
 	if err != nil {
-		return fmt.Errorf("invalid timestamp: %w", err)
+		return err
 	}
 
 	subjectUri := rec.Subject.Uri
@@ -310,7 +310,7 @@ func (b *BigQueryBackend) HandleCreateRepost(ctx context.Context, repo string, r
 		Kind:      "repost",
 		AuthorDID: repo,
 		Rkey:      rkey,
-		Created:   created.Time(),
+		Created:   created,
 		Indexed:   time.Now(),
 		SubjectID: subjectUri,
 	}
@@ -387,6 +387,36 @@ func parseCreatedFromRecord(rec any, rkey string) (time.Time, error) {
 
 	switch rec := rec.(type) {
 	case *bsky.FeedPost:
+		pt, err := parseTimestamp(rec.CreatedAt)
+		if err != nil {
+			return time.Time{}, err
+		}
+
+		if inRange(pt) {
+			return pt, nil
+		}
+
+		if rkeyTime.IsZero() || !inRange(rkeyTime) {
+			return time.Now(), nil
+		}
+
+		return rkeyTime, nil
+	case *bsky.FeedRepost:
+		pt, err := parseTimestamp(rec.CreatedAt)
+		if err != nil {
+			return time.Time{}, err
+		}
+
+		if inRange(pt) {
+			return pt, nil
+		}
+
+		if rkeyTime.IsZero() {
+			return time.Time{}, fmt.Errorf("failed to get a useful timestamp from record")
+		}
+
+		return rkeyTime, nil
+	case *bsky.FeedLike:
 		pt, err := parseTimestamp(rec.CreatedAt)
 		if err != nil {
 			return time.Time{}, err
