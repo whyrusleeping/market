@@ -23,9 +23,9 @@ var plog = slog.Default()
 
 // BigQueryBackend Handles interactions with BigQuery
 type BigQueryBackend struct {
-	s *Server
-
 	bfstore *backfill.Gormstore
+
+	interactionBatcher *bqBatcher[*BQInteraction]
 
 	client    *bigquery.Client
 	dataset   *bigquery.Dataset
@@ -33,6 +33,26 @@ type BigQueryBackend struct {
 	datasetID string
 	lastSeq   int64
 	seqLk     sync.Mutex
+}
+
+func NewBigQueryBackend(client *bigquery.Client, projectID, datasetID string, store *backfill.Gormstore) *BigQueryBackend {
+	dataset := client.Dataset(datasetID)
+
+	bqb := &BigQueryBackend{
+		bfstore:   store,
+		client:    client,
+		dataset:   dataset,
+		projectID: projectID,
+		datasetID: datasetID,
+	}
+
+	inserter := dataset.Table("interactions").Inserter()
+	inserter.SkipInvalidRows = true
+	bqb.interactionBatcher = &bqBatcher[*BQInteraction]{
+		inserter: inserter,
+	}
+
+	return bqb
 }
 
 type BQRecord struct {
@@ -251,8 +271,7 @@ func (b *BigQueryBackend) HandleCreateLike(ctx context.Context, repo string, rke
 		SubjectID: subjectUri,
 	}
 
-	inserter := b.dataset.Table("interactions").Inserter()
-	if err := inserter.Put(ctx, like); err != nil {
+	if err := b.interactionBatcher.Put(ctx, like); err != nil {
 		return fmt.Errorf("failed to insert like: %w", err)
 	}
 
@@ -282,8 +301,7 @@ func (b *BigQueryBackend) HandleCreateRepost(ctx context.Context, repo string, r
 		SubjectID: subjectUri,
 	}
 
-	inserter := b.dataset.Table("interactions").Inserter()
-	if err := inserter.Put(ctx, repost); err != nil {
+	if err := b.interactionBatcher.Put(ctx, repost); err != nil {
 		return fmt.Errorf("failed to insert repost: %w", err)
 	}
 
@@ -677,4 +695,27 @@ func (b *BigQueryBackend) revForRepo(repo string) (string, error) {
 	}
 
 	return job.Rev(), nil
+}
+
+type bqBatcher[T any] struct {
+	lk  sync.Mutex
+	buf []T
+
+	client   *bigquery.Client
+	inserter *bigquery.Inserter
+}
+
+func (b *bqBatcher[T]) Put(ctx context.Context, obj T) error {
+	b.lk.Lock()
+	b.buf = append(b.buf, obj)
+
+	if len(b.buf) > 1000 {
+		if err := b.inserter.Put(ctx, b.buf); err != nil {
+			return err
+		}
+		b.buf = b.buf[:0]
+	}
+
+	b.lk.Unlock()
+	return nil
 }

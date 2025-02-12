@@ -123,18 +123,7 @@ func main() {
 				return err
 			}
 
-			dataset := client.Dataset(datasetID)
-
-			bqb := &BigQueryBackend{
-				bfstore: gstore,
-
-				client:    client,
-				dataset:   dataset,
-				projectID: projectID,
-				datasetID: datasetID,
-			}
-
-			bend = bqb
+			bend = NewBigQueryBackend(client, projectID, datasetID, gstore)
 		} else {
 			db.AutoMigrate(Repo{})
 			db.AutoMigrate(Post{})
