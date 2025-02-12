@@ -707,6 +707,7 @@ type bqBatcher[T any] struct {
 
 func (b *bqBatcher[T]) Put(ctx context.Context, obj T) error {
 	b.lk.Lock()
+	defer b.lk.Unlock()
 	b.buf = append(b.buf, obj)
 
 	if len(b.buf) > 1000 {
@@ -716,6 +717,5 @@ func (b *bqBatcher[T]) Put(ctx context.Context, obj T) error {
 		b.buf = b.buf[:0]
 	}
 
-	b.lk.Unlock()
 	return nil
 }
