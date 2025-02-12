@@ -658,10 +658,11 @@ func (b *bqBatcher[T]) Put(ctx context.Context, obj T) error {
 	b.buf = append(b.buf, obj)
 
 	if len(b.buf) > 1000 {
-		if err := b.inserter.Put(ctx, b.buf); err != nil {
+		tosend := b.buf
+		b.buf = b.buf[:0]
+		if err := b.inserter.Put(ctx, tosend); err != nil {
 			return err
 		}
-		b.buf = b.buf[:0]
 	}
 
 	return nil
