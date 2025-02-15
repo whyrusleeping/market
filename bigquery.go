@@ -555,11 +555,11 @@ func (b *BigQueryBackend) HandleUpdate(ctx context.Context, repo string, rev str
 }
 
 type BQDeletion struct {
-	URI        string    `bigquery:"uri"`        // The URI of the deleted record
-	AuthorDID  string    `bigquery:"author_did"` // Who deleted it
-	Collection string    `bigquery:"collection"` // What type of record it was
-	DeletedAt  time.Time `bigquery:"deleted_at"` // When it was deleted
-	Rkey       string    `bigquery:"rkey"`       // The rkey of the deleted record
+	URI        string    `bigquery:"uri"`           // The URI of the deleted record
+	AuthorDID  string    `bigquery:"author_did"`    // Who deleted it
+	Collection string    `bigquery:"collection"`    // What type of record it was
+	DeletedAt  time.Time `bigquery:"deleted_at_dt"` // When it was deleted
+	Rkey       string    `bigquery:"rkey"`          // The rkey of the deleted record
 }
 
 func (b *BigQueryBackend) HandleDelete(ctx context.Context, repo string, rev string, path string) error {
