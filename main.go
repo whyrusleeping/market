@@ -26,7 +26,7 @@ import (
 	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/bluesky-social/indigo/backfill"
 	"github.com/bluesky-social/indigo/events"
-	"github.com/bluesky-social/indigo/events/schedulers/autoscaling"
+	"github.com/bluesky-social/indigo/events/schedulers/parallel"
 	"github.com/bluesky-social/indigo/util"
 	"github.com/bluesky-social/indigo/util/cliutil"
 	"github.com/bluesky-social/indigo/xrpc"
@@ -52,6 +52,12 @@ var handleOpHist = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Help:    "A histogram of op handling durations",
 	Buckets: prometheus.ExponentialBuckets(1, 2, 15),
 }, []string{"op", "collection"})
+
+var doEmbedHist = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "do_embed_hist",
+	Help:    "A histogram of embedding computation time",
+	Buckets: prometheus.ExponentialBucketsRange(0.001, 30, 20),
+}, []string{"model"})
 
 func main() {
 	app := cli.App{
@@ -90,6 +96,9 @@ func main() {
 		&cli.StringFlag{
 			Name: "bigquery-dataset",
 		},
+		&cli.StringFlag{
+			Name: "embedding-server",
+		},
 	}
 	app.Action = func(cctx *cli.Context) error {
 
@@ -113,7 +122,12 @@ func main() {
 
 		gstore := backfill.NewGormstore(db)
 
-		var bend Backend
+		s := &Server{
+			imageCacheDir:    cctx.String("image-dir"),
+			imageCacheServer: cctx.String("image-cache-server"),
+			bfdb:             db,
+		}
+
 		if useBigQuery {
 
 			auth := cctx.String("bigquery-auth")
@@ -151,7 +165,7 @@ func main() {
 				return err
 			}
 
-			bend = NewBigQueryBackend(client, projectID, datasetID, gstore)
+			s.backend = NewBigQueryBackend(client, projectID, datasetID, gstore)
 		} else {
 			db.AutoMigrate(Repo{})
 			db.AutoMigrate(Post{})
@@ -174,25 +188,32 @@ func main() {
 			revc, _ := lru.New2Q[uint, string](1_000_000)
 
 			pgb := &PostgresBackend{
+				s:             s,
 				bfstore:       gstore,
 				db:            db,
 				postInfoCache: pc,
 				repoCache:     rc,
 				revCache:      revc,
 			}
-			go pgb.runCountAggregator()
+			//go pgb.runCountAggregator()
 
-			bend = pgb
+			s.backend = pgb
+
 		}
 
-		s := &Server{
-			backend:          bend,
-			imageCacheDir:    cctx.String("image-dir"),
-			imageCacheServer: cctx.String("image-cache-server"),
-			bfdb:             db,
+		if embserv := cctx.String("embedding-server"); embserv != "" {
+			pgb, ok := s.backend.(*PostgresBackend)
+			if !ok {
+				return fmt.Errorf("can only use embedding service with postgres backend")
+
+			}
+			es := NewEmbStore(pgb.db, embserv, s, pgb)
+			s.embeddings = es
 		}
 
-		curs, err := s.LoadCursor(context.TODO())
+		ctx := context.TODO()
+
+		curs, err := s.LoadCursor(ctx)
 		if err != nil {
 			return err
 		}
@@ -203,7 +224,6 @@ func main() {
 			go s.imageFetcher()
 		}
 
-		ctx := context.TODO()
 		if err := gstore.LoadJobs(ctx); err != nil {
 			return err
 		}
@@ -282,13 +302,14 @@ func main() {
 			if !useBigQuery {
 				http.HandleFunc("/images/", s.handleServeImage)
 			}
+			http.HandleFunc("/reset/profile/", s.handleResetProfile)
 			http.ListenAndServe(":5151", nil)
 
 		}()
 
 		<-quit
 
-		return bend.Flush(ctx)
+		return s.backend.Flush(ctx)
 	}
 
 	app.RunAndExitOnError()
@@ -338,6 +359,8 @@ type Server struct {
 
 	imageCacheDir    string
 	imageCacheServer string
+
+	embeddings *embStore
 }
 
 func (s *Server) imagesEnabled() bool {
@@ -511,11 +534,7 @@ func (s *Server) startLiveTail(curs int) error {
 		},
 	}
 
-	settings := autoscaling.DefaultAutoscaleSettings()
-	settings.Concurrency = 10
-	settings.MaxConcurrency = 100
-
-	sched := autoscaling.NewScheduler(settings, con.RemoteAddr().String(), rsc.EventHandler)
+	sched := parallel.NewScheduler(100, 50, con.RemoteAddr().String(), rsc.EventHandler)
 
 	s.eventScheduler = sched
 	s.streamFinished = make(chan struct{})
@@ -1008,6 +1027,16 @@ func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey
 		Author: p.Author,
 	})
 
+	if b.s.embeddings != nil {
+		if err := b.s.embeddings.CreatePostEmbedding(ctx, repo, p.ID, &rec); err != nil {
+			slog.Error("failed to create post embedding", "did", repo.Did, "post_id", p.ID, "error", err)
+		} else {
+			if err := b.s.embeddings.CreateOrUpdateUserEmbedding(ctx, repo); err != nil {
+				slog.Error("failed to update user embedding", "did", repo.Did, "error", err)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -1040,6 +1069,12 @@ func (b *PostgresBackend) HandleCreateLike(ctx context.Context, repo *Repo, rkey
 		Val:  1,
 	}).Error; err != nil {
 		return err
+	}
+
+	if b.s.embeddings != nil {
+		if err := b.s.embeddings.CreateOrUpdateUserEmbedding(ctx, repo); err != nil {
+			slog.Error("failed to update user embedding", "error", err, "did", repo.Did)
+		}
 	}
 
 	return nil
@@ -1248,6 +1283,12 @@ func (b *PostgresBackend) HandleUpdateProfile(ctx context.Context, repo *Repo, r
 		Rev:     rev,
 	}).Error; err != nil {
 		return err
+	}
+
+	if b.s.embeddings != nil {
+		if err := b.s.embeddings.CreateOrUpdateUserEmbedding(ctx, repo); err != nil {
+			slog.Error("failed to update user embedding after profile change", "repo", repo.Did, "error", err)
+		}
 	}
 
 	return nil
@@ -1767,7 +1808,7 @@ func (s *Server) imageFetcher() {
 
 		var uris []string
 		for _, img := range images {
-			uri, err := s.uriForImage(img.Did, img.Cid)
+			uri, err := s.uriForImage(img.Did, img.Cid, "feed_fullsize")
 			if err != nil {
 				slog.Error("failed to get uri for image", "err", err)
 			}
@@ -1812,8 +1853,8 @@ func (b *PostgresBackend) getPostAuthorDid(p uint) (string, error) {
 	return did, nil
 }
 
-func (s *Server) uriForImage(did, cid string) (string, error) {
-	return fmt.Sprintf("https://cdn.bsky.app/img/feed_fullsize/plain/%s/%s@jpeg", did, cid), nil
+func (s *Server) uriForImage(did, cid, kind string) (string, error) {
+	return fmt.Sprintf("https://cdn.bsky.app/img/%s/plain/%s/%s@jpeg", kind, did, cid), nil
 }
 
 func (s *Server) batchCacheImages(dir string, images []string) []bool {
@@ -1856,11 +1897,13 @@ func (s *Server) maybeFetchImage(uri string, dir string) error {
 		return nil
 	}
 
-	start := time.Now()
-	var reqdo, tcopy, twrfile time.Time
-	defer func() {
-		fmt.Println("image fetch took: ", time.Since(start), reqdo.Sub(start), tcopy.Sub(start), twrfile.Sub(start))
-	}()
+	/*
+		start := time.Now()
+		var reqdo, tcopy, twrfile time.Time
+		defer func() {
+			fmt.Println("image fetch took: ", time.Since(start), reqdo.Sub(start), tcopy.Sub(start), twrfile.Sub(start))
+		}()
+	*/
 
 	req, err := http.NewRequest("GET", uri, nil)
 	if err != nil {
@@ -1876,7 +1919,7 @@ func (s *Server) maybeFetchImage(uri string, dir string) error {
 		return fmt.Errorf("fetch error: %w", err)
 	}
 
-	reqdo = time.Now()
+	//reqdo = time.Now()
 
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("non-200 response code: %d", resp.StatusCode)
@@ -1886,12 +1929,12 @@ func (s *Server) maybeFetchImage(uri string, dir string) error {
 	if err != nil {
 		return err
 	}
-	tcopy = time.Now()
+	//tcopy = time.Now()
 
 	if err := s.putImageToCache(cidpart, data); err != nil {
 		return err
 	}
-	twrfile = time.Now()
+	//twrfile = time.Now()
 
 	return nil
 }
@@ -1970,7 +2013,7 @@ func (s *Server) getImageFromCache(did, cc string, w io.Writer, doresize bool) e
 				return err
 			}
 
-			nimg := resize.Resize(224, 224, img, resize.Lanczos3)
+			nimg := resize.Resize(224, 224, img, resize.Lanczos2)
 
 			return jpeg.Encode(w, nimg, nil)
 		}
@@ -2010,6 +2053,65 @@ func (s *Server) getImageFromCache(did, cc string, w io.Writer, doresize bool) e
 	}
 }
 
+func (s *Server) handleResetProfile(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(r.URL.Path, "/")
+	did := parts[len(parts)-1]
+
+	if err := s.refetchProfileForDid(r.Context(), did); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+}
+
+func (s *Server) refetchProfileForDid(ctx context.Context, did string) error {
+	pgb, ok := s.backend.(*PostgresBackend)
+	if !ok {
+		return fmt.Errorf("only handling profile resets on postgres backend right now")
+	}
+
+	r, err := pgb.getOrCreateRepo(ctx, did)
+	if err != nil {
+		return err
+	}
+
+	ident, err := s.bf.Directory.LookupDID(ctx, syntax.DID(did))
+	if err != nil {
+		return err
+	}
+
+	pdsHost := ident.PDSEndpoint()
+
+	xrpcc := &xrpc.Client{
+		Host: pdsHost,
+	}
+
+	resp, err := atproto.RepoGetRecord(ctx, xrpcc, "", "app.bsky.actor.profile", did, "self")
+	if err != nil {
+		return err
+	}
+
+	profile, ok := resp.Value.Val.(*bsky.ActorProfile)
+	if !ok {
+		return fmt.Errorf("didnt get back a profile")
+	}
+
+	if resp.Cid == nil {
+		return fmt.Errorf("response had no cid")
+	}
+
+	cc, err := cid.Decode(*resp.Cid)
+	if err != nil {
+		return err
+	}
+
+	buf := new(bytes.Buffer)
+	if err := profile.MarshalCBOR(buf); err != nil {
+		return err
+	}
+
+	return pgb.HandleUpdateProfile(ctx, r, "self", "", buf.Bytes(), cc)
+}
+
 func (s *Server) handleServeImage(w http.ResponseWriter, r *http.Request) {
 	b := s.backend.(*PostgresBackend)
 
@@ -2022,7 +2124,7 @@ func (s *Server) handleServeImage(w http.ResponseWriter, r *http.Request) {
 		doresize = true
 	}
 
-	fmt.Printf("SERVING IMAGE: %q %q (resize=%v)\n", did, cc, doresize)
+	//fmt.Printf("SERVING IMAGE: %q %q (resize=%v)\n", did, cc, doresize)
 
 	var img Image
 	if err := b.db.Find(&img, "cid = ? AND did = ?", cc, did).Error; err != nil {
@@ -2030,7 +2132,7 @@ func (s *Server) handleServeImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	uri, err := s.uriForImage(did, cc)
+	uri, err := s.uriForImage(did, cc, "feed_fullsize")
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -2070,6 +2172,10 @@ func (s *Server) crawlOldPostsForPictures() error {
 		if len(postsToCheck) == 0 {
 			time.Sleep(time.Second * 10)
 			continue
+		}
+
+		if time.Since(postsToCheck[0].Created) > time.Hour*24*20 {
+			return nil
 		}
 
 		for _, p := range postsToCheck {
