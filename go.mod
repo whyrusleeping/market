@@ -6,13 +6,14 @@ toolchain go1.23.4
 
 require (
 	cloud.google.com/go/bigquery v1.66.2
-	github.com/bluesky-social/indigo v0.0.0-20250211193014-79a0357342cf
+	github.com/bluesky-social/indigo v0.0.0-20250303211155-50f1cdbe9517
 	github.com/goccy/go-json v0.10.5
 	github.com/gorilla/websocket v1.5.1
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/ipfs/go-cid v0.4.1
 	github.com/nfnt/resize v0.0.0-20180221191011-83c6a9932646
 	github.com/pgvector/pgvector-go v0.2.3
+	github.com/pixiv/go-libjpeg v0.0.0-20190822045933-3da21a74767d
 	github.com/prometheus/client_golang v1.19.1
 	github.com/urfave/cli/v2 v2.27.2
 	golang.org/x/oauth2 v0.25.0

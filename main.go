@@ -3,10 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
-	"image/jpeg"
+	_ "image/jpeg"
 	"io"
 	"log"
 	"log/slog"
@@ -20,6 +21,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pixiv/go-libjpeg/jpeg"
+
 	"cloud.google.com/go/bigquery"
 	"github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/api/bsky"
@@ -27,12 +30,15 @@ import (
 	"github.com/bluesky-social/indigo/backfill"
 	"github.com/bluesky-social/indigo/events"
 	"github.com/bluesky-social/indigo/events/schedulers/parallel"
+	"github.com/bluesky-social/indigo/repo"
 	"github.com/bluesky-social/indigo/util"
 	"github.com/bluesky-social/indigo/util/cliutil"
 	"github.com/bluesky-social/indigo/xrpc"
 	"github.com/gorilla/websocket"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/ipfs/go-cid"
+	"github.com/ipfs/go-datastore"
+	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	"github.com/nfnt/resize"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -58,6 +64,10 @@ var doEmbedHist = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Help:    "A histogram of embedding computation time",
 	Buckets: prometheus.ExponentialBucketsRange(0.001, 30, 20),
 }, []string{"model"})
+
+var firehoseCursorGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "firehose_cursor",
+}, []string{"stage"})
 
 func main() {
 	app := cli.App{
@@ -122,14 +132,16 @@ func main() {
 
 		gstore := backfill.NewGormstore(db)
 
+		lpuc, _ := lru.New[uint, time.Time](500_000)
+
 		s := &Server{
-			imageCacheDir:    cctx.String("image-dir"),
-			imageCacheServer: cctx.String("image-cache-server"),
-			bfdb:             db,
+			imageCacheDir:     cctx.String("image-dir"),
+			imageCacheServer:  cctx.String("image-cache-server"),
+			bfdb:              db,
+			lastProfileUpdate: lpuc,
 		}
 
 		if useBigQuery {
-
 			auth := cctx.String("bigquery-auth")
 			if auth == "" {
 				return fmt.Errorf("must specify bigquery-auth")
@@ -201,6 +213,8 @@ func main() {
 
 		}
 
+		ctx := context.TODO()
+
 		if embserv := cctx.String("embedding-server"); embserv != "" {
 			pgb, ok := s.backend.(*PostgresBackend)
 			if !ok {
@@ -210,8 +224,6 @@ func main() {
 			es := NewEmbStore(pgb.db, embserv, s, pgb)
 			s.embeddings = es
 		}
-
-		ctx := context.TODO()
 
 		curs, err := s.LoadCursor(ctx)
 		if err != nil {
@@ -303,12 +315,17 @@ func main() {
 				http.HandleFunc("/images/", s.handleServeImage)
 			}
 			http.HandleFunc("/reset/profile/", s.handleResetProfile)
+			http.HandleFunc("/rescan/repo/", s.handleRescanRepo)
+			http.HandleFunc("/check/repo/", s.handleCheckRepo)
 			http.ListenAndServe(":5151", nil)
 
 		}()
 
 		<-quit
 
+		if err := s.FlushCursor(); err != nil {
+			slog.Error("failed to flush cursor on close", "error", err)
+		}
 		return s.backend.Flush(ctx)
 	}
 
@@ -361,6 +378,8 @@ type Server struct {
 	imageCacheServer string
 
 	embeddings *embStore
+
+	lastProfileUpdate *lru.Cache[uint, time.Time]
 }
 
 func (s *Server) imagesEnabled() bool {
@@ -496,9 +515,14 @@ func (s *Server) startLiveTail(curs int) error {
 
 	}()
 
+	var cclk sync.Mutex
+	var completeCursor int64
+
 	rsc := &events.RepoStreamCallbacks{
 		RepoCommit: func(evt *atproto.SyncSubscribeRepos_Commit) error {
 			ctx := context.Background()
+
+			firehoseCursorGauge.WithLabelValues("ingest").Set(float64(evt.Seq))
 
 			s.seqLk.Lock()
 			if evt.Seq < s.lastSeq {
@@ -517,6 +541,13 @@ func (s *Server) startLiveTail(curs int) error {
 				return fmt.Errorf("handle event (%s,%d): %w", evt.Repo, evt.Seq, err)
 			}
 
+			cclk.Lock()
+			if evt.Seq > completeCursor {
+				completeCursor = evt.Seq
+				firehoseCursorGauge.WithLabelValues("complete").Set(float64(evt.Seq))
+			}
+			cclk.Unlock()
+
 			return nil
 		},
 		RepoHandle: func(handle *atproto.SyncSubscribeRepos_Handle) error {
@@ -534,7 +565,7 @@ func (s *Server) startLiveTail(curs int) error {
 		},
 	}
 
-	sched := parallel.NewScheduler(100, 50, con.RemoteAddr().String(), rsc.EventHandler)
+	sched := parallel.NewScheduler(300, 50, con.RemoteAddr().String(), rsc.EventHandler)
 
 	s.eventScheduler = sched
 	s.streamFinished = make(chan struct{})
@@ -1072,8 +1103,12 @@ func (b *PostgresBackend) HandleCreateLike(ctx context.Context, repo *Repo, rkey
 	}
 
 	if b.s.embeddings != nil {
-		if err := b.s.embeddings.CreateOrUpdateUserEmbedding(ctx, repo); err != nil {
-			slog.Error("failed to update user embedding", "error", err, "did", repo.Did)
+		lastCached, ok := b.s.lastProfileUpdate.Get(repo.ID)
+		if !ok || time.Since(lastCached) > time.Minute*10 {
+			if err := b.s.embeddings.CreateOrUpdateUserEmbedding(ctx, repo); err != nil {
+				slog.Error("failed to update user embedding", "error", err, "did", repo.Did)
+			}
+			b.s.lastProfileUpdate.Add(repo.ID, time.Now())
 		}
 	}
 
@@ -1533,7 +1568,8 @@ func (b *PostgresBackend) HandleDeletePost(ctx context.Context, repo *Repo, rkey
 	}
 
 	if p.ID == 0 {
-		return fmt.Errorf("delete of unknown post record: %s %s", repo.Did, rkey)
+		slog.Warn("delete of unknown post record", "repo", repo.Did, "rkey", rkey)
+		return nil
 	}
 
 	var rec bsky.FeedPost
@@ -1617,7 +1653,8 @@ func (b *PostgresBackend) HandleDeleteLike(ctx context.Context, repo *Repo, rkey
 	}
 
 	if like.ID == 0 {
-		return fmt.Errorf("delete of missing like: %s %s", repo.Did, rkey)
+		slog.Warn("delete of missing like", "repo", repo.Did, "rkey", rkey)
+		return nil
 	}
 
 	if err := b.db.Exec("DELETE FROM likes WHERE id = ?", like.ID).Error; err != nil {
@@ -1667,7 +1704,8 @@ func (b *PostgresBackend) HandleDeleteFollow(ctx context.Context, repo *Repo, rk
 	}
 
 	if follow.ID == 0 {
-		return fmt.Errorf("delete of missing follow: %s %s", repo.Did, rkey)
+		slog.Warn("delete of missing follow", "repo", repo.Did, "rkey", rkey)
+		return nil
 	}
 
 	if err := b.db.Exec("DELETE FROM follows WHERE id = ?", follow.ID).Error; err != nil {
@@ -1684,7 +1722,8 @@ func (b *PostgresBackend) HandleDeleteBlock(ctx context.Context, repo *Repo, rke
 	}
 
 	if block.ID == 0 {
-		return fmt.Errorf("delete of missing block: %s %s", repo.Did, rkey)
+		slog.Warn("delete of missing block", "repo", repo.Did, "rkey", rkey)
+		return nil
 	}
 
 	if err := b.db.Exec("DELETE FROM blocks WHERE id = ?", block.ID).Error; err != nil {
@@ -2008,14 +2047,25 @@ func (s *Server) getImageFromCache(did, cc string, w io.Writer, doresize bool) e
 		}
 
 		if doresize {
-			img, _, err := image.Decode(resp.Body)
+			//img, _, err := image.Decode(resp.Body)
+			img, err := jpeg.Decode(resp.Body, &jpeg.DecoderOptions{
+				ScaleTarget: image.Rectangle{
+					Max: image.Point{
+						X: 224,
+						Y: 224,
+					},
+				},
+			})
 			if err != nil {
 				return err
 			}
 
+			//fmt.Println("Image after decoding: ", img.Bounds().Dx(), img.Bounds().Dy())
+
 			nimg := resize.Resize(224, 224, img, resize.Lanczos2)
 
-			return jpeg.Encode(w, nimg, nil)
+			opts := jpeg.EncoderOptions{Quality: 75}
+			return jpeg.Encode(w, nimg, &opts)
 		}
 
 		body, err := io.ReadAll(resp.Body)
@@ -2041,7 +2091,8 @@ func (s *Server) getImageFromCache(did, cc string, w io.Writer, doresize bool) e
 
 			nimg := resize.Resize(224, 224, img, resize.Lanczos3)
 
-			return jpeg.Encode(w, nimg, nil)
+			opts := jpeg.EncoderOptions{Quality: 75}
+			return jpeg.Encode(w, nimg, &opts)
 		}
 
 		if _, err := io.Copy(w, fi); err != nil {
@@ -2110,6 +2161,129 @@ func (s *Server) refetchProfileForDid(ctx context.Context, did string) error {
 	}
 
 	return pgb.HandleUpdateProfile(ctx, r, "self", "", buf.Bytes(), cc)
+}
+
+func (s *Server) handleRescanRepo(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(r.URL.Path, "/")
+	did := parts[len(parts)-1]
+
+	ctx := r.Context()
+	job, err := s.bf.Store.GetJob(ctx, did)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	oldstate := job.State()
+
+	if err := job.SetState(ctx, "enqueued"); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	if err := json.NewEncoder(w).Encode(map[string]string{"status": "ok", "oldstate": oldstate}); err != nil {
+		slog.Error("failed to write response", "error", err)
+	}
+}
+
+func (s *Server) handleCheckRepo(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(r.URL.Path, "/")
+	did := parts[len(parts)-1]
+
+	missing, err := s.refetchRepoForDid(r.Context(), did)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	if err := json.NewEncoder(w).Encode(missing); err != nil {
+		slog.Error("failed to write response", "error", err)
+
+	}
+}
+
+func (s *Server) refetchRepoForDid(ctx context.Context, did string) ([]string, error) {
+	pgb, ok := s.backend.(*PostgresBackend)
+	if !ok {
+		return nil, fmt.Errorf("only handling repo resets on postgres backend right now")
+	}
+
+	r, err := pgb.getOrCreateRepo(ctx, did)
+	if err != nil {
+		return nil, err
+	}
+
+	ident, err := s.bf.Directory.LookupDID(ctx, syntax.DID(did))
+	if err != nil {
+		return nil, err
+	}
+
+	pdsHost := ident.PDSEndpoint()
+
+	xrpcc := &xrpc.Client{
+		Host: pdsHost,
+	}
+
+	repob, err := atproto.SyncGetRepo(ctx, xrpcc, did, "")
+	if err != nil {
+		return nil, err
+	}
+
+	bs := blockstore.NewBlockstore(datastore.NewMapDatastore())
+	rrcid, err := repo.IngestRepo(ctx, bs, bytes.NewReader(repob))
+	if err != nil {
+		return nil, err
+	}
+
+	rr, err := repo.OpenRepo(ctx, bs, rrcid)
+	if err != nil {
+		return nil, err
+	}
+
+	var missing []string
+	if err := rr.ForEach(ctx, "", func(k string, v cid.Cid) error {
+		parts := strings.Split(k, "/")
+
+		switch parts[0] {
+		case "app.bsky.feed.post":
+			var post Post
+			if err := s.embeddings.db.Find(&post, "rkey = ? AND author = ?", parts[1], r.ID).Error; err != nil {
+				return err
+			}
+			if post.ID == 0 {
+				missing = append(missing, k)
+			}
+		case "app.bsky.feed.like":
+			var like Like
+			if err := s.embeddings.db.Find(&like, "rkey = ? AND author = ?", parts[1], r.ID).Error; err != nil {
+				return err
+			}
+			if like.ID == 0 {
+				missing = append(missing, k)
+			}
+		case "app.bsky.graph.follow":
+			var fol Follow
+			if err := s.embeddings.db.Find(&fol, "rkey = ? AND author = ?", parts[1], r.ID).Error; err != nil {
+				return err
+			}
+			if fol.ID == 0 {
+				missing = append(missing, k)
+			}
+		case "app.bsky.graph.block":
+			var blk Block
+			if err := s.embeddings.db.Find(&blk, "rkey = ? AND author = ?", parts[1], r.ID).Error; err != nil {
+				return err
+			}
+			if blk.ID == 0 {
+				missing = append(missing, k)
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return missing, nil
 }
 
 func (s *Server) handleServeImage(w http.ResponseWriter, r *http.Request) {

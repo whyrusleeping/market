@@ -63,11 +63,11 @@ func NewEmbStore(db *gorm.DB, embserv string, s *Server, b *PostgresBackend) *em
 */
 
 type postEmbedBody struct {
-	Post            *bsky.FeedPost    `json:"post"`
-	Images          map[string][]byte `json:"images"`
-	ReplyType       string            `json:"reply_type"`
-	AuthorEmbedding *Embedding        `json:"author_embedding"`
-	ParentEmbedding *Embedding        `json:"parent_embedding"`
+	Post            *bsky.FeedPost `json:"post"`
+	Images          []*pictureObj  `json:"images"`
+	ReplyType       string         `json:"reply_type"`
+	AuthorEmbedding *Embedding     `json:"author_embedding"`
+	ParentEmbedding *Embedding     `json:"parent_embedding"`
 }
 
 type Embedding struct {
@@ -176,18 +176,19 @@ func (s *embStore) computePostEmbedding(ctx context.Context, r *Repo, fp *bsky.F
 	}
 
 	if fp.Embed != nil && fp.Embed.EmbedImages != nil {
-		images := make(map[string][]byte)
 		for _, img := range fp.Embed.EmbedImages.Images {
 			if img.Image != nil {
-				imgb, uri, err := s.getImage(ctx, r.Did, img.Image.Ref.String(), "feed_fullsize")
+				imgb, _, err := s.getImage(ctx, r.Did, img.Image.Ref.String(), "feed_fullsize")
 				if err != nil {
 					return nil, err
 				}
 
-				images[uri] = imgb
+				peb.Images = append(peb.Images, &pictureObj{
+					Cid:   img.Image.Ref.String(),
+					Bytes: imgb,
+				})
 			}
 		}
-		peb.Images = images
 	}
 
 	b, err := json.Marshal(peb)
@@ -266,8 +267,10 @@ func (s *embStore) CreateOrUpdateUserEmbedding(ctx context.Context, r *Repo) err
 	}
 
 	var bp bsky.ActorProfile
-	if err := bp.UnmarshalCBOR(bytes.NewReader(prof.Raw)); err != nil {
-		slog.Error("failed to unmarshal profile bytes", "error", err)
+	if len(prof.Raw) > 0 {
+		if err := bp.UnmarshalCBOR(bytes.NewReader(prof.Raw)); err != nil {
+			slog.Error("failed to unmarshal profile bytes", "error", err)
+		}
 	}
 
 	var description, name string
@@ -281,24 +284,24 @@ func (s *embStore) CreateOrUpdateUserEmbedding(ctx context.Context, r *Repo) err
 	var pfpBytes, headerBytes *pictureObj
 
 	if bp.Avatar != nil {
-		imgb, url, err := s.getImage(ctx, r.Did, bp.Avatar.Ref.String(), "avatar")
+		imgb, _, err := s.getImage(ctx, r.Did, bp.Avatar.Ref.String(), "avatar")
 		if err != nil {
 			slog.Error("fetching avatar image failed", "did", r.Did, "cid", bp.Avatar.Ref.String(), "error", err)
 		} else {
 			pfpBytes = &pictureObj{
-				Url:   url,
+				Cid:   bp.Avatar.Ref.String(),
 				Bytes: imgb,
 			}
 		}
 	}
 
 	if bp.Banner != nil {
-		imgb, url, err := s.getImage(ctx, r.Did, bp.Banner.Ref.String(), "banner")
+		imgb, _, err := s.getImage(ctx, r.Did, bp.Banner.Ref.String(), "banner")
 		if err != nil {
 			slog.Error("fetching banner image failed", "did", r.Did, "cid", bp.Banner.Ref.String(), "error", err)
 		} else {
 			headerBytes = &pictureObj{
-				Url:   url,
+				Cid:   bp.Banner.Ref.String(),
 				Bytes: imgb,
 			}
 		}
@@ -334,13 +337,21 @@ func (s *embStore) CreateOrUpdateUserEmbedding(ctx context.Context, r *Repo) err
 
 func (s *embStore) getRecentUserInteractions(ctx context.Context, r *Repo) ([]Embedding, error) {
 	var posts []postEmbedding
-	if err := s.db.Raw("SELECT post_embeddings.* FROM posts INNER JOIN post_embeddings ON post_embeddings.post = posts.id WHERE author = ? ORDER BY posts.created DESC limit 10", r.ID).Scan(&posts).Error; err != nil {
+	if err := s.db.Raw("SELECT * FROM post_embeddings WHERE post IN (SELECT id FROM posts WHERE author = ? ORDER BY posts.rkey DESC limit 15)", r.ID).Scan(&posts).Error; err != nil {
 		return nil, err
 	}
 
 	var likedPosts []postEmbedding
-	if err := s.db.Raw("SELECT post_embeddings.* FROM likes INNER JOIN post_embeddings ON post_embeddings.post = likes.subject WHERE likes.author = ? ORDER BY likes.rkey DESC limit 10", r.ID).Scan(&likedPosts).Error; err != nil {
+	if err := s.db.Raw("SELECT * FROM post_embeddings WHERE post IN (SELECT subject FROM likes WHERE likes.author = ? ORDER BY likes.rkey DESC limit 15)", r.ID).Scan(&likedPosts).Error; err != nil {
 		return nil, err
+	}
+
+	if len(posts) > 10 {
+		posts = posts[:10]
+	}
+
+	if len(likedPosts) > 10 {
+		likedPosts = likedPosts[:10]
 	}
 
 	var out []Embedding
@@ -399,7 +410,7 @@ func averageEmbeddings(embs []Embedding) *Embedding {
 */
 
 type pictureObj struct {
-	Url   string `json:"url"`
+	Cid   string `json:"cid"`
 	Bytes []byte `json:"bytes"`
 }
 type userEmbedBody struct {
