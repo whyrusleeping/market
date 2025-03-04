@@ -931,7 +931,33 @@ func (b *PostgresBackend) Flush(ctx context.Context) error {
 	return nil
 }
 
+func (b *PostgresBackend) checkPostExists(ctx context.Context, repo *Repo, rkey string) (bool, error) {
+	var result struct {
+		ID       uint
+		NotFound bool
+	}
+	if err := b.db.Raw("select id, not_found from posts where author = ? and rkey = ?", repo.ID, rkey).Scan(&result).Error; err != nil {
+		return false, err
+	}
+
+	if result.ID != 0 && !result.NotFound {
+		return true, nil
+	}
+
+	return false, nil
+}
+
 func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
+	exists, err := b.checkPostExists(ctx, repo, rkey)
+	if err != nil {
+		return err
+	}
+
+	// still technically a race condition if two creates for the same post happen concurrently... probably fine
+	if exists {
+		return nil
+	}
+
 	var rec bsky.FeedPost
 	if err := rec.UnmarshalCBOR(bytes.NewReader(recb)); err != nil {
 		return err
@@ -950,6 +976,8 @@ func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey
 		Raw:     recb,
 	}
 
+	var postCountTasks []*PostCountsTask
+
 	if rec.Reply != nil && rec.Reply.Parent != nil {
 		if rec.Reply.Root == nil {
 			return fmt.Errorf("post reply had nil root")
@@ -963,13 +991,11 @@ func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey
 		p.ReplyTo = pinfo.ID
 		p.ReplyToUsr = pinfo.Author
 
-		if err := b.db.Create(&PostCountsTask{
+		postCountTasks = append(postCountTasks, &PostCountsTask{
 			Post: pinfo.ID,
 			Op:   "reply",
 			Val:  1,
-		}).Error; err != nil {
-			return err
-		}
+		})
 
 		thread, err := b.postIDForUri(ctx, rec.Reply.Root.Uri)
 		if err != nil {
@@ -978,13 +1004,11 @@ func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey
 
 		p.InThread = thread
 
-		if err := b.db.Create(&PostCountsTask{
+		postCountTasks = append(postCountTasks, &PostCountsTask{
 			Post: thread,
 			Op:   "thread",
 			Val:  1,
-		}).Error; err != nil {
-			return err
-		}
+		})
 	}
 
 	var images []*Image
@@ -1008,14 +1032,11 @@ func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey
 
 			p.Reposting = rp
 
-			if err := b.db.Create(&PostCountsTask{
+			postCountTasks = append(postCountTasks, &PostCountsTask{
 				Post: rp,
 				Op:   "quote",
 				Val:  1,
-			}).Error; err != nil {
-				return err
-			}
-
+			})
 		}
 
 		if rec.Embed.EmbedImages != nil {
@@ -1039,6 +1060,13 @@ func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey
 	}).Create(&p).Error; err != nil {
 		return err
 	}
+
+	if len(postCountTasks) > 0 {
+		if err := b.db.Create(postCountTasks).Error; err != nil {
+			return err
+		}
+	}
+
 	if err := b.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&PostCounts{Post: p.ID}).Error; err != nil {
 		return err
 	}
@@ -2175,6 +2203,11 @@ func (s *Server) handleRescanRepo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	oldstate := job.State()
+
+	if err := job.SetRev(ctx, ""); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
 
 	if err := job.SetState(ctx, "enqueued"); err != nil {
 		http.Error(w, err.Error(), 500)
