@@ -108,6 +108,10 @@ func main() {
 		&cli.StringFlag{
 			Name: "embedding-server",
 		},
+		&cli.BoolFlag{
+			Name:  "skip-aggregations",
+			Usage: "skip more expensive count aggregations",
+		},
 	}
 	app.Action = func(cctx *cli.Context) error {
 
@@ -138,6 +142,7 @@ func main() {
 			imageCacheServer:  cctx.String("image-cache-server"),
 			bfdb:              db,
 			lastProfileUpdate: lpuc,
+			skipAggregations:  cctx.Bool("skip-aggregations"),
 		}
 
 		if useBigQuery {
@@ -208,7 +213,20 @@ func main() {
 				repoCache:     rc,
 				revCache:      revc,
 			}
-			//go pgb.runCountAggregator()
+
+			/*
+				np, err := pgb.aggregateCounts()
+				if err != nil {
+					slog.Error("failed to aggregate counts", "err", err)
+				}
+
+				fmt.Println("finished aggregations: ", np)
+				return nil
+			*/
+
+			if !s.skipAggregations {
+				go pgb.runCountAggregator()
+			}
 
 			s.backend = pgb
 
@@ -373,6 +391,8 @@ type Server struct {
 	backend Backend
 
 	con *websocket.Conn
+
+	skipAggregations bool
 
 	eventScheduler events.Scheduler
 	streamFinished chan struct{}
@@ -1070,7 +1090,7 @@ func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey
 		return err
 	}
 
-	if len(postCountTasks) > 0 {
+	if len(postCountTasks) > 0 && !b.s.skipAggregations {
 		if err := b.db.Create(postCountTasks).Error; err != nil {
 			return err
 		}
@@ -1131,12 +1151,14 @@ func (b *PostgresBackend) HandleCreateLike(ctx context.Context, repo *Repo, rkey
 		return err
 	}
 
-	if err := b.db.Create(&PostCountsTask{
-		Post: pid,
-		Op:   "like",
-		Val:  1,
-	}).Error; err != nil {
-		return err
+	if !b.s.skipAggregations {
+		if err := b.db.Create(&PostCountsTask{
+			Post: pid,
+			Op:   "like",
+			Val:  1,
+		}).Error; err != nil {
+			return err
+		}
 	}
 
 	if b.s.embeddings != nil {
@@ -1177,12 +1199,14 @@ func (b *PostgresBackend) HandleCreateRepost(ctx context.Context, repo *Repo, rk
 		return err
 	}
 
-	if err := b.db.Create(&PostCountsTask{
-		Post: pid,
-		Op:   "repost",
-		Val:  1,
-	}).Error; err != nil {
-		return err
+	if !b.s.skipAggregations {
+		if err := b.db.Create(&PostCountsTask{
+			Post: pid,
+			Op:   "repost",
+			Val:  1,
+		}).Error; err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -1672,6 +1696,8 @@ func (b *PostgresBackend) HandleDeletePost(ctx context.Context, repo *Repo, rkey
 		return err
 	}
 
+	var postCountTasks []PostCountsTask
+
 	if rec.Reply != nil && rec.Reply.Parent != nil {
 		reptoid, err := b.postIDForUri(ctx, rec.Reply.Parent.Uri)
 		if err != nil {
@@ -1680,13 +1706,11 @@ func (b *PostgresBackend) HandleDeletePost(ctx context.Context, repo *Repo, rkey
 
 		p.ReplyTo = reptoid
 
-		if err := b.db.Create(&PostCountsTask{
+		postCountTasks = append(postCountTasks, PostCountsTask{
 			Post: reptoid,
 			Op:   "reply",
 			Val:  -1,
-		}).Error; err != nil {
-			return err
-		}
+		})
 
 		thread, err := b.postIDForUri(ctx, rec.Reply.Root.Uri)
 		if err != nil {
@@ -1695,13 +1719,11 @@ func (b *PostgresBackend) HandleDeletePost(ctx context.Context, repo *Repo, rkey
 
 		p.InThread = thread
 
-		if err := b.db.Create(&PostCountsTask{
+		postCountTasks = append(postCountTasks, PostCountsTask{
 			Post: thread,
 			Op:   "thread",
 			Val:  -1,
-		}).Error; err != nil {
-			return err
-		}
+		})
 	}
 
 	if rec.Embed != nil {
@@ -1723,14 +1745,18 @@ func (b *PostgresBackend) HandleDeletePost(ctx context.Context, repo *Repo, rkey
 
 			p.Reposting = rp
 
-			if err := b.db.Create(&PostCountsTask{
+			postCountTasks = append(postCountTasks, PostCountsTask{
 				Post: rp,
 				Op:   "quote",
 				Val:  -1,
-			}).Error; err != nil {
-				return err
-			}
+			})
 
+		}
+	}
+
+	if !b.s.skipAggregations && len(postCountTasks) > 0 {
+		if err := b.db.Create(postCountTasks).Error; err != nil {
+			return err
 		}
 	}
 
@@ -1756,12 +1782,14 @@ func (b *PostgresBackend) HandleDeleteLike(ctx context.Context, repo *Repo, rkey
 		return err
 	}
 
-	if err := b.db.Create(&PostCountsTask{
-		Post: like.Subject,
-		Op:   "like",
-		Val:  -1,
-	}).Error; err != nil {
-		return err
+	if !b.s.skipAggregations {
+		if err := b.db.Create(&PostCountsTask{
+			Post: like.Subject,
+			Op:   "like",
+			Val:  -1,
+		}).Error; err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -1781,12 +1809,14 @@ func (b *PostgresBackend) HandleDeleteRepost(ctx context.Context, repo *Repo, rk
 		return err
 	}
 
-	if err := b.db.Create(&PostCountsTask{
-		Post: repost.Subject,
-		Op:   "repost",
-		Val:  -1,
-	}).Error; err != nil {
-		return err
+	if !b.s.skipAggregations {
+		if err := b.db.Create(&PostCountsTask{
+			Post: repost.Subject,
+			Op:   "repost",
+			Val:  -1,
+		}).Error; err != nil {
+			return err
+		}
 	}
 
 	return nil
