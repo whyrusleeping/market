@@ -153,3 +153,23 @@ type Image struct {
 	Cached bool
 	Failed bool
 }
+
+type PostGate struct {
+	ID      uint `gorm:"primarykey"`
+	Created time.Time
+	Indexed time.Time
+	Author  uint   `gorm:"uniqueIndex:idx_likes_rkeyauthor"`
+	Rkey    string `gorm:"uniqueIndex:idx_likes_rkeyauthor"`
+	Subject uint
+	Raw     []byte
+}
+
+type StarterPack struct {
+	ID      uint `gorm:"primarykey"`
+	Created time.Time
+	Indexed time.Time
+	Author  uint   `gorm:"uniqueIndex:idx_likes_rkeyauthor"`
+	Rkey    string `gorm:"uniqueIndex:idx_likes_rkeyauthor"`
+	Raw     []byte
+	List    uint `gorm:"index"`
+}

@@ -76,8 +76,7 @@ func main() {
 
 	app.Flags = []cli.Flag{
 		&cli.StringFlag{
-			Name:  "image-dir",
-			Value: "image-cache",
+			Name: "image-dir",
 		},
 		&cli.StringFlag{
 			Name:    "db-url",
@@ -194,6 +193,8 @@ func main() {
 			db.AutoMigrate(ThreadGate{})
 			db.AutoMigrate(FeedGenerator{})
 			db.AutoMigrate(Image{})
+			db.AutoMigrate(PostGate{})
+			db.AutoMigrate(StarterPack{})
 
 			rc, _ := lru.New2Q[string, *Repo](1_000_000)
 			pc, _ := lru.New2Q[string, *cachedPostInfo](5_000_000)
@@ -295,11 +296,13 @@ func main() {
 
 			s.con.Close()
 
-			bf.Stop(context.TODO())
-
 			// Shutdown the ingester.
 			streamCancel()
 			<-streamClosed
+
+			time.Sleep(time.Millisecond * 100)
+
+			bf.Stop(context.TODO())
 
 			if err := s.FlushCursor(); err != nil {
 				slog.Error("final flush cursor failed", "err", err)
@@ -525,12 +528,10 @@ func (s *Server) startLiveTail(curs int) error {
 			firehoseCursorGauge.WithLabelValues("ingest").Set(float64(evt.Seq))
 
 			s.seqLk.Lock()
-			if evt.Seq < s.lastSeq {
-				s.seqLk.Unlock()
-				return nil
+			if evt.Seq > s.lastSeq {
+				curs = int(evt.Seq)
+				s.lastSeq = evt.Seq
 			}
-			curs = int(evt.Seq)
-			s.lastSeq = evt.Seq
 			s.seqLk.Unlock()
 
 			lelk.Lock()
@@ -836,7 +837,7 @@ func (b *PostgresBackend) HandleCreate(ctx context.Context, repo string, rev str
 	}
 	if lrev != "" {
 		if rev < lrev {
-			//slog.Info("skipping old rev create", "did", rr.Did, "rev", rev, "oldrev", lrev, "path", path)
+			slog.Info("skipping old rev create", "did", rr.Did, "rev", rev, "oldrev", lrev, "path", path)
 			return nil
 		}
 	}
@@ -905,8 +906,16 @@ func (b *PostgresBackend) HandleCreate(ctx context.Context, repo string, rev str
 		if err := b.HandleCreateChatDeclaration(ctx, rr, rkey, *rec, *cid); err != nil {
 			return err
 		}
+	case "app.bsky.feed.postgate":
+		if err := b.HandleCreatePostGate(ctx, rr, rkey, *rec, *cid); err != nil {
+			return err
+		}
+	case "app.bsky.graph.starterpack":
+		if err := b.HandleCreateStarterPack(ctx, rr, rkey, *rec, *cid); err != nil {
+			return err
+		}
 	default:
-		return fmt.Errorf("unrecognized record type: %q", col)
+		slog.Warn("unrecognized record type", "repo", repo, "path", path, "rev", rev)
 	}
 
 	b.revCache.Add(rr.ID, rev)
@@ -1415,6 +1424,64 @@ func (b *PostgresBackend) HandleCreateChatDeclaration(ctx context.Context, repo 
 	return nil
 }
 
+func (b *PostgresBackend) HandleCreatePostGate(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
+	var rec bsky.FeedPostgate
+	if err := rec.UnmarshalCBOR(bytes.NewReader(recb)); err != nil {
+		return err
+	}
+	created, err := syntax.ParseDatetimeLenient(rec.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("invalid timestamp: %w", err)
+	}
+
+	refPost, err := b.getPostByUri(ctx, rec.Post)
+	if err != nil {
+		return err
+	}
+
+	if err := b.db.Create(&PostGate{
+		Created: created.Time(),
+		Indexed: time.Now(),
+		Author:  repo.ID,
+		Rkey:    rkey,
+		Subject: refPost.ID,
+		Raw:     recb,
+	}).Error; err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (b *PostgresBackend) HandleCreateStarterPack(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
+	var rec bsky.GraphStarterpack
+	if err := rec.UnmarshalCBOR(bytes.NewReader(recb)); err != nil {
+		return err
+	}
+	created, err := syntax.ParseDatetimeLenient(rec.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("invalid timestamp: %w", err)
+	}
+
+	list, err := b.getOrCreateList(ctx, rec.List)
+	if err != nil {
+		return err
+	}
+
+	if err := b.db.Create(&StarterPack{
+		Created: created.Time(),
+		Indexed: time.Now(),
+		Author:  repo.ID,
+		Rkey:    rkey,
+		Raw:     recb,
+		List:    list.ID,
+	}).Error; err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (b *PostgresBackend) HandleUpdate(ctx context.Context, repo string, rev string, path string, rec *[]byte, cid *cid.Cid) error {
 	start := time.Now()
 
@@ -1503,7 +1570,7 @@ func (b *PostgresBackend) HandleUpdate(ctx context.Context, repo string, rev str
 				}
 		*/
 	default:
-		return fmt.Errorf("unrecognized record type: %q", col)
+		slog.Warn("unrecognized record type in update", "repo", repo, "path", path, "rev", rev)
 	}
 
 	return nil
@@ -1582,7 +1649,7 @@ func (b *PostgresBackend) HandleDelete(ctx context.Context, repo string, rev str
 			return err
 		}
 	default:
-		return fmt.Errorf("delete unrecognized record type: %q", col)
+		slog.Warn("delete unrecognized record type", "repo", repo, "path", path, "rev", rev)
 	}
 
 	b.revCache.Add(rr.ID, rev)
