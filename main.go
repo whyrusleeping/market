@@ -112,6 +112,14 @@ func main() {
 			Name:  "skip-aggregations",
 			Usage: "skip more expensive count aggregations",
 		},
+		&cli.IntFlag{
+			Name:  "max-consumer-workers",
+			Value: 300,
+		},
+		&cli.IntFlag{
+			Name:  "max-consumer-queue",
+			Value: 50,
+		},
 	}
 	app.Action = func(cctx *cli.Context) error {
 
@@ -251,7 +259,7 @@ func main() {
 
 		go s.syncCursorRoutine()
 
-		if !useBigQuery {
+		if s.imagesEnabled() && !useBigQuery {
 			go s.imageFetcher()
 		}
 
@@ -286,7 +294,7 @@ func main() {
 			}()
 		}
 
-		if err := s.startLiveTail(curs); err != nil {
+		if err := s.startLiveTail(curs, cctx.Int("max-consumer-workers"), cctx.Int("max-consumer-queue")); err != nil {
 			slog.Error("failed to start live tail", "err", err)
 			return err
 		}
@@ -503,7 +511,7 @@ func (s *Server) maybePumpRepos(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) startLiveTail(curs int) error {
+func (s *Server) startLiveTail(curs int, parWorkers, maxQ int) error {
 	slog.Info("starting live tail")
 
 	// Connect to the Relay websocket
@@ -586,7 +594,7 @@ func (s *Server) startLiveTail(curs int) error {
 		},
 	}
 
-	sched := parallel.NewScheduler(300, 50, con.RemoteAddr().String(), rsc.EventHandler)
+	sched := parallel.NewScheduler(parWorkers, maxQ, con.RemoteAddr().String(), rsc.EventHandler)
 
 	s.eventScheduler = sched
 	s.streamFinished = make(chan struct{})
