@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pixiv/go-libjpeg/jpeg"
 
 	"cloud.google.com/go/bigquery"
@@ -212,6 +213,11 @@ func main() {
 			pc, _ := lru.New2Q[string, *cachedPostInfo](5_000_000)
 			revc, _ := lru.New2Q[uint, string](1_000_000)
 
+			pool, err := pgxpool.New(context.TODO(), cctx.String("db-url"))
+			if err != nil {
+				return err
+			}
+
 			pgb := &PostgresBackend{
 				s:             s,
 				bfstore:       gstore,
@@ -219,6 +225,7 @@ func main() {
 				postInfoCache: pc,
 				repoCache:     rc,
 				revCache:      revc,
+				pgx:           pool,
 			}
 
 			/*
@@ -776,12 +783,89 @@ func (b *PostgresBackend) postInfoForUri(ctx context.Context, uri string) (*cach
 	}
 
 	// getPostByUri implicitly fills the cache
-	p, err := b.getPostByUri(ctx, uri, "id, author")
+	p, err := b.getOrCreatePostBare(ctx, uri)
 	if err != nil {
 		return nil, err
 	}
 
 	return &cachedPostInfo{ID: p.ID, Author: p.Author}, nil
+}
+
+func (b *PostgresBackend) tryLoadPostInfo(ctx context.Context, uid uint, rkey string) (*Post, error) {
+	q := "SELECT id, author FROM posts WHERE author = $1 AND rkey = $2"
+	rows, err := b.pgx.Query(ctx, q, uid, rkey)
+	if err != nil {
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	// no such post found
+	if !rows.Next() {
+		return nil, nil
+	}
+
+	var p Post
+	if err := rows.Scan(&p.ID, &p.Author); err != nil {
+		return nil, err
+	}
+
+	return &p, nil
+}
+
+func (b *PostgresBackend) getOrCreatePostBare(ctx context.Context, uri string) (*Post, error) {
+	puri, err := util.ParseAtUri(uri)
+	if err != nil {
+		return nil, err
+	}
+
+	r, err := b.getOrCreateRepo(ctx, puri.Did)
+	if err != nil {
+		return nil, err
+	}
+
+	post, err := b.tryLoadPostInfo(ctx, r.ID, puri.Rkey)
+	if err != nil {
+		return nil, err
+	}
+
+	if post == nil {
+		post = &Post{
+			Rkey:     puri.Rkey,
+			Author:   r.ID,
+			NotFound: true,
+		}
+
+		if err := b.db.Session(&gorm.Session{
+			Logger: logger.Default.LogMode(logger.Silent),
+		}).Create(post).Error; err != nil {
+			if !errors.Is(err, gorm.ErrDuplicatedKey) {
+				return nil, err
+			}
+			out, err := b.tryLoadPostInfo(ctx, r.ID, puri.Rkey)
+			if err != nil {
+				return nil, fmt.Errorf("got duplicate post and still couldnt find it: %w", err)
+			}
+			if out == nil {
+				return nil, fmt.Errorf("postgres is lying to us: %d %s", r.ID, puri.Rkey)
+			}
+
+			post = out
+		}
+
+		if !b.s.skipAggregations {
+			if err := b.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&PostCounts{Post: post.ID}).Error; err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	b.postInfoCache.Add(uri, &cachedPostInfo{
+		ID:     post.ID,
+		Author: post.Author,
+	})
+
+	return post, nil
 }
 
 func (b *PostgresBackend) getPostByUri(ctx context.Context, uri string, fields string) (*Post, error) {
@@ -817,8 +901,10 @@ func (b *PostgresBackend) getPostByUri(ctx context.Context, uri string, fields s
 				return nil, fmt.Errorf("got duplicate post and still couldnt find it: %w", err)
 			}
 		}
-		if err := b.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&PostCounts{Post: post.ID}).Error; err != nil {
-			return nil, err
+		if !b.s.skipAggregations {
+			if err := b.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&PostCounts{Post: post.ID}).Error; err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -947,8 +1033,9 @@ func (b *PostgresBackend) HandleCreate(ctx context.Context, repo string, rev str
 }
 
 type PostgresBackend struct {
-	db *gorm.DB
-	s  *Server
+	db  *gorm.DB
+	pgx *pgxpool.Pool
+	s   *Server
 
 	bfstore *backfill.Gormstore
 
@@ -1024,12 +1111,6 @@ func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey
 		p.ReplyTo = pinfo.ID
 		p.ReplyToUsr = pinfo.Author
 
-		postCountTasks = append(postCountTasks, &PostCountsTask{
-			Post: pinfo.ID,
-			Op:   "reply",
-			Val:  1,
-		})
-
 		thread, err := b.postIDForUri(ctx, rec.Reply.Root.Uri)
 		if err != nil {
 			return fmt.Errorf("getting thread root: %w", err)
@@ -1037,11 +1118,20 @@ func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey
 
 		p.InThread = thread
 
-		postCountTasks = append(postCountTasks, &PostCountsTask{
-			Post: thread,
-			Op:   "thread",
-			Val:  1,
-		})
+		if !b.s.skipAggregations {
+			postCountTasks = append(postCountTasks,
+				&PostCountsTask{
+					Post: pinfo.ID,
+					Op:   "reply",
+					Val:  1,
+				},
+				&PostCountsTask{
+					Post: thread,
+					Op:   "thread",
+					Val:  1,
+				},
+			)
+		}
 	}
 
 	var images []*Image
