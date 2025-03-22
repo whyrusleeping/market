@@ -26,6 +26,7 @@ import (
 	"cloud.google.com/go/bigquery"
 	"github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/api/bsky"
+	arepo "github.com/bluesky-social/indigo/atproto/repo"
 	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/bluesky-social/indigo/backfill"
 	"github.com/bluesky-social/indigo/events"
@@ -37,8 +38,6 @@ import (
 	"github.com/gorilla/websocket"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/ipfs/go-cid"
-	"github.com/ipfs/go-datastore"
-	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	"github.com/nfnt/resize"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -2364,7 +2363,7 @@ func (s *Server) refetchRepoForDid(ctx context.Context, did string) ([]string, e
 		return nil, err
 	}
 
-	bs := blockstore.NewBlockstore(datastore.NewMapDatastore())
+	bs := arepo.NewTinyBlockstore()
 	rrcid, err := repo.IngestRepo(ctx, bs, bytes.NewReader(repob))
 	if err != nil {
 		return nil, err
