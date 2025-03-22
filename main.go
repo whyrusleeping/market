@@ -218,6 +218,10 @@ func main() {
 				return err
 			}
 
+			if err := pool.Ping(context.TODO()); err != nil {
+				return err
+			}
+
 			pgb := &PostgresBackend{
 				s:             s,
 				bfstore:       gstore,
