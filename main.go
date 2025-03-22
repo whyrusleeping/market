@@ -761,13 +761,8 @@ type cachedPostInfo struct {
 }
 
 func (b *PostgresBackend) postIDForUri(ctx context.Context, uri string) (uint, error) {
-	v, ok := b.postInfoCache.Get(uri)
-	if ok {
-		return v.ID, nil
-	}
-
 	// getPostByUri implicitly fills the cache
-	p, err := b.getPostByUri(ctx, uri)
+	p, err := b.postInfoForUri(ctx, uri)
 	if err != nil {
 		return 0, err
 	}
@@ -782,7 +777,7 @@ func (b *PostgresBackend) postInfoForUri(ctx context.Context, uri string) (*cach
 	}
 
 	// getPostByUri implicitly fills the cache
-	p, err := b.getPostByUri(ctx, uri)
+	p, err := b.getPostByUri(ctx, uri, "id, author")
 	if err != nil {
 		return nil, err
 	}
@@ -790,7 +785,7 @@ func (b *PostgresBackend) postInfoForUri(ctx context.Context, uri string) (*cach
 	return &cachedPostInfo{ID: p.ID, Author: p.Author}, nil
 }
 
-func (b *PostgresBackend) getPostByUri(ctx context.Context, uri string) (*Post, error) {
+func (b *PostgresBackend) getPostByUri(ctx context.Context, uri string, fields string) (*Post, error) {
 	puri, err := util.ParseAtUri(uri)
 	if err != nil {
 		return nil, err
@@ -801,8 +796,10 @@ func (b *PostgresBackend) getPostByUri(ctx context.Context, uri string) (*Post, 
 		return nil, err
 	}
 
+	q := "SELECT " + fields + " FROM posts WHERE author = ? AND rkey = ?"
+
 	var post Post
-	if err := b.db.Find(&post, "author = ? AND rkey = ?", r.ID, puri.Rkey).Error; err != nil {
+	if err := b.db.Raw(q, r.ID, puri.Rkey).Scan(&post).Error; err != nil {
 		return nil, err
 	}
 
@@ -1466,7 +1463,7 @@ func (b *PostgresBackend) HandleCreatePostGate(ctx context.Context, repo *Repo, 
 		return fmt.Errorf("invalid timestamp: %w", err)
 	}
 
-	refPost, err := b.getPostByUri(ctx, rec.Post)
+	refPost, err := b.postInfoForUri(ctx, rec.Post)
 	if err != nil {
 		return err
 	}
