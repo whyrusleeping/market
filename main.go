@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pixiv/go-libjpeg/jpeg"
 
@@ -723,14 +724,17 @@ func (b *PostgresBackend) getOrCreateRepo(ctx context.Context, did string) (*Rep
 		return r, nil
 	}
 
-	if err := b.db.Find(r, "did = ?", did).Error; err != nil {
-		return nil, err
-	}
+	row := b.pgx.QueryRow(ctx, "SELECT id, created_at, did, handle FROM repos WHERE did = $1", did)
 
-	if r.ID != 0 {
+	err := row.Scan(&r.ID, &r.CreatedAt, &r.Did, &r.Handle)
+	if err == nil {
 		// found it!
 		r.Setup = true
 		return r, nil
+	}
+
+	if err != pgx.ErrNoRows {
+		return nil, err
 	}
 
 	r.Did = did
