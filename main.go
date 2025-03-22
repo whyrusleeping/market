@@ -724,9 +724,9 @@ func (b *PostgresBackend) getOrCreateRepo(ctx context.Context, did string) (*Rep
 		return r, nil
 	}
 
-	row := b.pgx.QueryRow(ctx, "SELECT id, created_at, did, handle FROM repos WHERE did = $1", did)
+	row := b.pgx.QueryRow(ctx, "SELECT id, created_at, did FROM repos WHERE did = $1", did)
 
-	err := row.Scan(&r.ID, &r.CreatedAt, &r.Did, &r.Handle)
+	err := row.Scan(&r.ID, &r.CreatedAt, &r.Did)
 	if err == nil {
 		// found it!
 		r.Setup = true
@@ -1198,8 +1198,10 @@ func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey
 		}
 	}
 
-	if err := b.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&PostCounts{Post: p.ID}).Error; err != nil {
-		return err
+	if !b.s.skipAggregations {
+		if err := b.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&PostCounts{Post: p.ID}).Error; err != nil {
+			return err
+		}
 	}
 
 	if len(images) > 0 {

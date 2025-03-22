@@ -11,7 +11,6 @@ type Repo struct {
 	ID        uint `gorm:"primarykey"`
 	CreatedAt time.Time
 	Did       string `gorm:"uniqueIndex"`
-	Handle    string
 
 	// cache fields
 	Lk    sync.Mutex `gorm:"-"`
