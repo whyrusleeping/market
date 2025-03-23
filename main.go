@@ -853,7 +853,7 @@ func (b *PostgresBackend) getOrCreatePostBare(ctx context.Context, uri string) (
 		err := b.pgx.QueryRow(ctx, "INSERT INTO posts (rkey, author, not_found) VALUES ($1, $2, $3) RETURNING id", puri.Rkey, r.ID, true).Scan(&post.ID)
 		if err != nil {
 			pgErr, ok := err.(*pgconn.PgError)
-			if !ok || pgErr.Code == "23505" {
+			if !ok || pgErr.Code != "23505" {
 				return nil, err
 			}
 
