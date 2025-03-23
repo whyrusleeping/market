@@ -62,43 +62,45 @@ type Pgxstore struct {
 }
 
 func NewPgxStore(pool *pgxpool.Pool) (*Pgxstore, error) {
-	_, err := pool.Exec(context.Background(), `
-	CREATE TABLE IF NOT EXISTS gorm_db_jobs (
-		id BIGSERIAL PRIMARY KEY,
-		created_at TIMESTAMP WITH TIME ZONE,
-		updated_at TIMESTAMP WITH TIME ZONE,
-		deleted_at TIMESTAMP WITH TIME ZONE,
-		repo TEXT,
-		state TEXT,
-		rev TEXT,
-		retry_count BIGINT,
-		retry_after TIMESTAMP WITH TIME ZONE
-	);
-	
-	-- Create indexes if they don't exist
-	CREATE INDEX IF NOT EXISTS idx_gorm_db_jobs_deleted_at ON gorm_db_jobs (deleted_at);
-	CREATE INDEX IF NOT EXISTS idx_gorm_db_jobs_repo ON gorm_db_jobs (repo);
-	CREATE INDEX IF NOT EXISTS idx_gorm_db_jobs_state ON gorm_db_jobs (state);
-	
-	-- Create unique constraint if it doesn't exist
-	DO $$ 
-	BEGIN
-		IF NOT EXISTS (
-			SELECT 1 FROM pg_constraint 
-			WHERE conname = 'gorm_db_jobs_repo_key' 
-			AND conrelid = 'gorm_db_jobs'::regclass
-		) THEN
-			ALTER TABLE gorm_db_jobs ADD CONSTRAINT gorm_db_jobs_repo_key UNIQUE (repo);
-		END IF;
-	END $$;
-	
-	-- Create conditional indexes
-	CREATE INDEX IF NOT EXISTS enqueued_job_idx ON gorm_db_jobs (state) WHERE state = 'enqueued';
-	CREATE INDEX IF NOT EXISTS retryable_job_idx ON gorm_db_jobs (state, retry_after DESC) WHERE state LIKE 'failed%';
-	`)
-	if err != nil {
-		return nil, err
-	}
+	/*
+		_, err := pool.Exec(context.Background(), `
+		CREATE TABLE IF NOT EXISTS gorm_db_jobs (
+			id BIGSERIAL PRIMARY KEY,
+			created_at TIMESTAMP WITH TIME ZONE,
+			updated_at TIMESTAMP WITH TIME ZONE,
+			deleted_at TIMESTAMP WITH TIME ZONE,
+			repo TEXT,
+			state TEXT,
+			rev TEXT,
+			retry_count BIGINT,
+			retry_after TIMESTAMP WITH TIME ZONE
+		);
+
+		-- Create indexes if they don't exist
+		CREATE INDEX IF NOT EXISTS idx_gorm_db_jobs_deleted_at ON gorm_db_jobs (deleted_at);
+		CREATE INDEX IF NOT EXISTS idx_gorm_db_jobs_repo ON gorm_db_jobs (repo);
+		CREATE INDEX IF NOT EXISTS idx_gorm_db_jobs_state ON gorm_db_jobs (state);
+
+		-- Create unique constraint if it doesn't exist
+		DO $$
+		BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM pg_constraint
+				WHERE conname = 'gorm_db_jobs_repo_key'
+				AND conrelid = 'gorm_db_jobs'::regclass
+			) THEN
+				ALTER TABLE gorm_db_jobs ADD CONSTRAINT gorm_db_jobs_repo_key UNIQUE (repo);
+			END IF;
+		END $$;
+
+		-- Create conditional indexes
+		CREATE INDEX IF NOT EXISTS enqueued_job_idx ON gorm_db_jobs (state) WHERE state = 'enqueued';
+		CREATE INDEX IF NOT EXISTS retryable_job_idx ON gorm_db_jobs (state, retry_after DESC) WHERE state LIKE 'failed%';
+		`)
+		if err != nil {
+			return nil, err
+		}
+	*/
 
 	return &Pgxstore{
 		jobs: make(map[string]*Pgxjob),

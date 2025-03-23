@@ -969,7 +969,7 @@ func (b *PostgresBackend) revForRepo(rr *Repo) (string, error) {
 	}
 
 	var rev string
-	if err := b.db.Raw("SELECT rev FROM gorm_db_jobs WHERE repo = ?", rr.Did).Scan(&rev).Error; err != nil {
+	if err := b.db.Raw("SELECT COALESCE(rev, '') FROM gorm_db_jobs WHERE repo = ?", rr.Did).Scan(&rev).Error; err != nil {
 		return "", err
 	}
 
