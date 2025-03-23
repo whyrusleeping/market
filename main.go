@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgconn"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pixiv/go-libjpeg/jpeg"
@@ -120,6 +121,10 @@ func main() {
 		&cli.IntFlag{
 			Name:  "max-consumer-queue",
 			Value: 50,
+		},
+		&cli.IntFlag{
+			Name:  "backfill-parallel-record-creates",
+			Value: 20,
 		},
 	}
 	app.Action = func(cctx *cli.Context) error {
@@ -280,6 +285,7 @@ func main() {
 
 		opts := backfill.DefaultBackfillOptions()
 		opts.SyncRequestsPerSecond = 30
+		opts.ParallelRecordCreates = cctx.Int("backfill-parallel-record-creates")
 		opts.ParallelBackfills = cctx.Int("backfill-workers")
 
 		bf := backfill.NewBackfiller("market", gstore, s.backend.HandleCreate, s.backend.HandleUpdate, s.backend.HandleDelete, opts)
@@ -844,12 +850,13 @@ func (b *PostgresBackend) getOrCreatePostBare(ctx context.Context, uri string) (
 			NotFound: true,
 		}
 
-		if err := b.db.Session(&gorm.Session{
-			Logger: logger.Default.LogMode(logger.Silent),
-		}).Create(post).Error; err != nil {
-			if !errors.Is(err, gorm.ErrDuplicatedKey) {
+		err := b.pgx.QueryRow(ctx, "INSERT INTO posts (rkey, author, not_found) VALUES ($1, $2, $3) RETURNING id", puri.Rkey, r.ID, true).Scan(&post.ID)
+		if err != nil {
+			pgErr, ok := err.(*pgconn.PgError)
+			if !ok || pgErr.Code == "23505" {
 				return nil, err
 			}
+
 			out, err := b.tryLoadPostInfo(ctx, r.ID, puri.Rkey)
 			if err != nil {
 				return nil, fmt.Errorf("got duplicate post and still couldnt find it: %w", err)
