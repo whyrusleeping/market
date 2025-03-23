@@ -295,9 +295,20 @@ func (s *Pgxstore) getJob(ctx context.Context, repo string) (*Pgxjob, error) {
 	return s.loadJob(ctx, repo)
 }
 
+func maybeTime(t *time.Time) time.Time {
+	if t == nil {
+		return time.Time{}
+	}
+	return *t
+}
+
 func (s *Pgxstore) loadJob(ctx context.Context, repo string) (*Pgxjob, error) {
-	var dbj backfill.GormDBJob
-	if err := s.db.QueryRow(ctx, "SELECT id, created_at, updated_at, repo, state, rev, retry_count, retry_after FROM gorm_db_jobs WHERE repo = $1", repo).Scan(&dbj.ID, &dbj.CreatedAt, &dbj.UpdatedAt, &dbj.Repo, &dbj.State, &dbj.Rev, &dbj.RetryCount, &dbj.RetryAfter); err != nil {
+	var jobid uint
+	var state, rev *string
+	var retryCount *int
+	var createdAt, updatedAt, retryAt *time.Time
+
+	if err := s.db.QueryRow(ctx, "SELECT id, created_at, updated_at, state, rev, retry_count, retry_after FROM gorm_db_jobs WHERE repo = $1", repo).Scan(&jobid, &createdAt, &updatedAt, &state, &rev, &retryCount, &retryAt); err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, backfill.ErrJobNotFound
 		}
@@ -305,19 +316,23 @@ func (s *Pgxstore) loadJob(ctx context.Context, repo string) (*Pgxjob, error) {
 	}
 
 	j := &Pgxjob{
-		repo:      dbj.Repo,
-		state:     dbj.State,
-		createdAt: dbj.CreatedAt,
-		updatedAt: dbj.UpdatedAt,
+		repo:       repo,
+		createdAt:  maybeTime(createdAt),
+		updatedAt:  maybeTime(updatedAt),
+		retryAfter: retryAt,
 
-		jobID: dbj.ID,
+		jobID: jobid,
 
 		//dbj: &dbj,
 		db: s.db,
-
-		retryCount: dbj.RetryCount,
-		retryAfter: dbj.RetryAfter,
 	}
+	if state != nil {
+		j.state = *state
+	}
+	if retryCount != nil {
+		j.retryCount = *retryCount
+	}
+
 	s.lk.Lock()
 	defer s.lk.Unlock()
 	// would imply a race condition
