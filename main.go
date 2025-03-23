@@ -147,7 +147,33 @@ func main() {
 
 		useBigQuery := cctx.Bool("enable-bigquery-backend")
 
-		gstore := backfill.NewGormstore(db)
+		var bfstore backfill.Store
+		if db.Dialector.Name() == "postgres" {
+			pool, err := pgxpool.New(context.TODO(), cctx.String("db-url"))
+			if err != nil {
+				return err
+			}
+
+			if err := pool.Ping(context.TODO()); err != nil {
+				return err
+			}
+
+			pgxstore, err := NewPgxStore(pool)
+			if err != nil {
+				return err
+			}
+			bfstore = pgxstore
+
+			if err := pgxstore.LoadJobs(context.TODO()); err != nil {
+				return err
+			}
+		} else {
+			gstore := backfill.NewGormstore(db)
+			if err := gstore.LoadJobs(context.TODO()); err != nil {
+				return err
+			}
+			bfstore = gstore
+		}
 
 		lpuc, _ := lru.New[uint, time.Time](500_000)
 
@@ -195,7 +221,7 @@ func main() {
 				return err
 			}
 
-			s.backend = NewBigQueryBackend(client, projectID, datasetID, gstore)
+			s.backend = NewBigQueryBackend(client, projectID, datasetID, bfstore)
 		} else {
 			db.AutoMigrate(Repo{})
 			db.AutoMigrate(Post{})
@@ -230,7 +256,7 @@ func main() {
 
 			pgb := &PostgresBackend{
 				s:             s,
-				bfstore:       gstore,
+				bfstore:       bfstore,
 				db:            db,
 				postInfoCache: pc,
 				repoCache:     rc,
@@ -279,18 +305,14 @@ func main() {
 			go s.imageFetcher()
 		}
 
-		if err := gstore.LoadJobs(ctx); err != nil {
-			return err
-		}
-
 		opts := backfill.DefaultBackfillOptions()
 		opts.SyncRequestsPerSecond = 30
 		opts.ParallelRecordCreates = cctx.Int("backfill-parallel-record-creates")
 		opts.ParallelBackfills = cctx.Int("backfill-workers")
 
-		bf := backfill.NewBackfiller("market", gstore, s.backend.HandleCreate, s.backend.HandleUpdate, s.backend.HandleDelete, opts)
+		bf := backfill.NewBackfiller("market", bfstore, s.backend.HandleCreate, s.backend.HandleUpdate, s.backend.HandleDelete, opts)
 		s.bf = bf
-		s.store = gstore
+		s.store = bfstore
 
 		go bf.Start()
 
@@ -407,7 +429,7 @@ type Backend interface {
 
 type Server struct {
 	bf    *backfill.Backfiller
-	store *backfill.Gormstore
+	store backfill.Store
 	bfdb  *gorm.DB
 
 	lastSeq int64
@@ -478,6 +500,10 @@ type MarketConfig struct {
 	RepoScanDone bool
 }
 
+type jobMaker interface {
+	GetOrCreateJob(context.Context, string, string) (backfill.Job, error)
+}
+
 func (s *Server) maybePumpRepos(ctx context.Context) error {
 	var cfg MarketConfig
 	if err := s.bfdb.Find(&cfg, "id = 1").Error; err != nil {
@@ -499,6 +525,11 @@ func (s *Server) maybePumpRepos(ctx context.Context) error {
 		Host: "https://bsky.network",
 	}
 
+	jmstore, ok := s.store.(jobMaker)
+	if !ok {
+		return fmt.Errorf("configured backfil jobstore doesnt support random job creation")
+	}
+
 	var curs string
 	for {
 		resp, err := atproto.SyncListRepos(ctx, xrpcc, curs, 1000)
@@ -507,7 +538,7 @@ func (s *Server) maybePumpRepos(ctx context.Context) error {
 		}
 
 		for _, r := range resp.Repos {
-			_, err := s.store.GetOrCreateJob(ctx, r.Did, backfill.StateEnqueued)
+			_, err := jmstore.GetOrCreateJob(ctx, r.Did, backfill.StateEnqueued)
 			if err != nil {
 				slog.Error("failed to create backfill job", "did", r.Did, "err", err)
 				continue
@@ -1052,7 +1083,7 @@ type PostgresBackend struct {
 	pgx *pgxpool.Pool
 	s   *Server
 
-	bfstore *backfill.Gormstore
+	bfstore backfill.Store
 
 	revCache *lru.TwoQueueCache[uint, string]
 
@@ -1080,6 +1111,17 @@ func (b *PostgresBackend) checkPostExists(ctx context.Context, repo *Repo, rkey 
 	}
 
 	return false, nil
+}
+
+func (b *PostgresBackend) doPostCreate(ctx context.Context, p *Post) error {
+	if err := b.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "author"}, {Name: "rkey"}},
+		DoUpdates: clause.AssignmentColumns([]string{"cid", "not_found", "raw", "created", "indexed"}),
+	}).Create(p).Error; err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey string, recb []byte, cc cid.Cid) error {
@@ -1192,10 +1234,7 @@ func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey
 		}
 	}
 
-	if err := b.db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "author"}, {Name: "rkey"}},
-		DoUpdates: clause.AssignmentColumns([]string{"cid", "not_found", "raw", "created", "indexed"}),
-	}).Create(&p).Error; err != nil {
+	if err := b.doPostCreate(ctx, &p); err != nil {
 		return err
 	}
 

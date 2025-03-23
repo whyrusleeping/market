@@ -24,7 +24,7 @@ var plog = slog.Default()
 
 // BigQueryBackend Handles interactions with BigQuery
 type BigQueryBackend struct {
-	bfstore *backfill.Gormstore
+	bfstore backfill.Store
 
 	interactionBatcher *bqBatcher[*BQInteraction]
 	followsBatcher     *bqBatcher[*BQFollow]
@@ -38,7 +38,7 @@ type BigQueryBackend struct {
 	seqLk     sync.Mutex
 }
 
-func NewBigQueryBackend(client *bigquery.Client, projectID, datasetID string, store *backfill.Gormstore) *BigQueryBackend {
+func NewBigQueryBackend(client *bigquery.Client, projectID, datasetID string, store backfill.Store) *BigQueryBackend {
 	dataset := client.Dataset(datasetID)
 
 	bqb := &BigQueryBackend{
