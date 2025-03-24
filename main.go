@@ -242,7 +242,7 @@ func main() {
 			db.AutoMigrate(StarterPack{})
 
 			rc, _ := lru.New2Q[string, *Repo](1_000_000)
-			pc, _ := lru.New2Q[string, *cachedPostInfo](5_000_000)
+			pc, _ := lru.New2Q[string, cachedPostInfo](5_000_000)
 			revc, _ := lru.New2Q[uint, string](1_000_000)
 
 			pool, err := pgxpool.New(context.TODO(), cctx.String("db-url"))
@@ -821,7 +821,7 @@ func (b *PostgresBackend) postIDForUri(ctx context.Context, uri string) (uint, e
 	return p.ID, nil
 }
 
-func (b *PostgresBackend) postInfoForUri(ctx context.Context, uri string) (*cachedPostInfo, error) {
+func (b *PostgresBackend) postInfoForUri(ctx context.Context, uri string) (cachedPostInfo, error) {
 	v, ok := b.postInfoCache.Get(uri)
 	if ok {
 		return v, nil
@@ -830,10 +830,10 @@ func (b *PostgresBackend) postInfoForUri(ctx context.Context, uri string) (*cach
 	// getPostByUri implicitly fills the cache
 	p, err := b.getOrCreatePostBare(ctx, uri)
 	if err != nil {
-		return nil, err
+		return cachedPostInfo{}, err
 	}
 
-	return &cachedPostInfo{ID: p.ID, Author: p.Author}, nil
+	return cachedPostInfo{ID: p.ID, Author: p.Author}, nil
 }
 
 func (b *PostgresBackend) tryLoadPostInfo(ctx context.Context, uid uint, rkey string) (*Post, error) {
@@ -906,7 +906,7 @@ func (b *PostgresBackend) getOrCreatePostBare(ctx context.Context, uri string) (
 		}
 	}
 
-	b.postInfoCache.Add(uri, &cachedPostInfo{
+	b.postInfoCache.Add(uri, cachedPostInfo{
 		ID:     post.ID,
 		Author: post.Author,
 	})
@@ -954,7 +954,7 @@ func (b *PostgresBackend) getPostByUri(ctx context.Context, uri string, fields s
 		}
 	}
 
-	b.postInfoCache.Add(uri, &cachedPostInfo{
+	b.postInfoCache.Add(uri, cachedPostInfo{
 		ID:     post.ID,
 		Author: post.Author,
 	})
@@ -1090,7 +1090,7 @@ type PostgresBackend struct {
 	repoCache *lru.TwoQueueCache[string, *Repo]
 	reposLk   sync.Mutex
 
-	postInfoCache *lru.TwoQueueCache[string, *cachedPostInfo]
+	postInfoCache *lru.TwoQueueCache[string, cachedPostInfo]
 }
 
 func (b *PostgresBackend) Flush(ctx context.Context) error {
@@ -1260,7 +1260,7 @@ func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey
 	}
 
 	uri := "at://" + repo.Did + "/app.bsky.feed.post/" + rkey
-	b.postInfoCache.Add(uri, &cachedPostInfo{
+	b.postInfoCache.Add(uri, cachedPostInfo{
 		ID:     p.ID,
 		Author: p.Author,
 	})
