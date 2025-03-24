@@ -126,6 +126,10 @@ func main() {
 			Name:  "backfill-parallel-record-creates",
 			Value: 20,
 		},
+		&cli.IntFlag{
+			Name:  "post-cache-size",
+			Value: 5_000_000,
+		},
 	}
 	app.Action = func(cctx *cli.Context) error {
 
@@ -147,14 +151,11 @@ func main() {
 
 		useBigQuery := cctx.Bool("enable-bigquery-backend")
 
-		lpuc, _ := lru.New[uint, time.Time](500_000)
-
 		s := &Server{
-			imageCacheDir:     cctx.String("image-dir"),
-			imageCacheServer:  cctx.String("image-cache-server"),
-			bfdb:              db,
-			lastProfileUpdate: lpuc,
-			skipAggregations:  cctx.Bool("skip-aggregations"),
+			imageCacheDir:    cctx.String("image-dir"),
+			imageCacheServer: cctx.String("image-cache-server"),
+			bfdb:             db,
+			skipAggregations: cctx.Bool("skip-aggregations"),
 		}
 
 		var bfstore backfill.Store
@@ -242,7 +243,7 @@ func main() {
 			db.AutoMigrate(StarterPack{})
 
 			rc, _ := lru.New2Q[string, *Repo](1_000_000)
-			pc, _ := lru.New2Q[string, cachedPostInfo](5_000_000)
+			pc, _ := lru.New2Q[string, cachedPostInfo](cctx.Int("post-cache-size"))
 			revc, _ := lru.New2Q[uint, string](1_000_000)
 
 			cfg, err := pgxpool.ParseConfig(cctx.String("db-url"))
@@ -296,6 +297,9 @@ func main() {
 			}
 			es := NewEmbStore(pgb.db, embserv, s, pgb)
 			s.embeddings = es
+
+			lpuc, _ := lru.New[uint, time.Time](500_000)
+			s.lastProfileUpdate = lpuc
 		}
 
 		curs, err := s.LoadCursor(ctx)
@@ -2301,6 +2305,8 @@ func (s *Server) imageIsCached(cc string) (bool, error) {
 			return false, err
 		}
 
+		defer resp.Body.Close()
+
 		switch resp.StatusCode {
 		case 200:
 			return true, nil
@@ -2326,6 +2332,8 @@ func (s *Server) putImageToCache(cc string, b []byte) error {
 		if err != nil {
 			return err
 		}
+		defer resp.Body.Close()
+
 		if resp.StatusCode != 200 {
 			return fmt.Errorf("invalid response for post file: %d", resp.StatusCode)
 		}
