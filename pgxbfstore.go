@@ -28,9 +28,6 @@ type Pgxjob struct {
 	//dbj *GormDBJob
 	db *pgxpool.Pool
 
-	createdAt time.Time
-	updatedAt time.Time
-
 	retryCount int
 	retryAfter *time.Time
 }
@@ -225,21 +222,16 @@ func (s *Pgxstore) createJobForRepo(repo, state string) error {
 	s.lk.Lock()
 	defer s.lk.Unlock()
 
-	// Convert it to an in-memory job
 	if _, ok := s.jobs[repo]; ok {
-		// The DB create should have errored if the job already existed, but just in case
 		return fmt.Errorf("job already exists for repo %s", repo)
 	}
 
 	j := &Pgxjob{
-		repo:      repo,
-		createdAt: time.Now(),
-		updatedAt: time.Now(),
-		state:     state,
+		//repo:  repo,
+		state: state,
 
 		jobID: idout,
 
-		//dbj: dbj,
 		db: s.db,
 	}
 	s.jobs[repo] = j
@@ -279,7 +271,6 @@ func (j *Pgxjob) BufferOps(ctx context.Context, since *string, rev string, ops [
 
 func (j *Pgxjob) bufferOps(ops *opSet) {
 	j.bufferedOps = append(j.bufferedOps, ops)
-	j.updatedAt = time.Now()
 }
 
 func (s *Pgxstore) GetJob(ctx context.Context, repo string) (backfill.Job, error) {
@@ -316,14 +307,11 @@ func (s *Pgxstore) loadJob(ctx context.Context, repo string) (*Pgxjob, error) {
 	}
 
 	j := &Pgxjob{
-		repo:       repo,
-		createdAt:  maybeTime(createdAt),
-		updatedAt:  maybeTime(updatedAt),
+		//repo:       repo,
 		retryAfter: retryAt,
 
 		jobID: jobid,
 
-		//dbj: &dbj,
 		db: s.db,
 	}
 	if state != nil {
@@ -402,14 +390,8 @@ func (j *Pgxjob) SetRev(ctx context.Context, r string) error {
 	defer j.lk.Unlock()
 
 	j.rev = r
-	j.updatedAt = time.Now()
 
-	//j.dbj.Rev = r
-	//j.dbj.UpdatedAt = j.updatedAt
-
-	// Persist the job to the database
-
-	_, err := j.db.Exec(ctx, "UPDATE gorm_db_jobs SET rev = $1, updated_at = $2 WHERE id = $3", r, j.updatedAt, j.jobID)
+	_, err := j.db.Exec(ctx, "UPDATE gorm_db_jobs SET rev = $1, updated_at = $2 WHERE id = $3", r, time.Now(), j.jobID)
 	return err
 }
 
@@ -429,7 +411,6 @@ func (j *Pgxjob) SetState(ctx context.Context, state string) error {
 	defer j.lk.Unlock()
 
 	j.state = state
-	j.updatedAt = time.Now()
 
 	if strings.HasPrefix(state, "failed") {
 		if j.retryCount < backfill.MaxRetries {
@@ -441,8 +422,7 @@ func (j *Pgxjob) SetState(ctx context.Context, state string) error {
 		}
 	}
 
-	// Persist the job to the database
-	_, err := j.db.Exec(ctx, "UPDATE gorm_db_jobs SET state = $1, updated_at = $2 WHERE id = $3", state, j.updatedAt, j.jobID)
+	_, err := j.db.Exec(ctx, "UPDATE gorm_db_jobs SET state = $1, updated_at = $2 WHERE id = $3", state, time.Now(), j.jobID)
 	return err
 }
 
@@ -494,7 +474,6 @@ func (j *Pgxjob) ClearBufferedOps(ctx context.Context) error {
 	defer j.lk.Unlock()
 
 	j.bufferedOps = []*opSet{}
-	j.updatedAt = time.Now()
 	return nil
 }
 
