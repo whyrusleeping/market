@@ -50,6 +50,8 @@ github.com/bluesky-social/indigo v0.0.0-20250324185434-0196da09d52b h1:4O9499DQi
 github.com/bluesky-social/indigo v0.0.0-20250324185434-0196da09d52b/go.mod h1:NVBwZvbBSa93kfyweAmKwOLYawdVHdwZ9s+GZtBBVLA=
 github.com/bluesky-social/indigo v0.0.0-20250324225732-73083999ae94 h1:h45sfJGe1L2Cu+wz21fOUbhTdZN2bCwVGZdugFhWadg=
 github.com/bluesky-social/indigo v0.0.0-20250324225732-73083999ae94/go.mod h1:NVBwZvbBSa93kfyweAmKwOLYawdVHdwZ9s+GZtBBVLA=
+github.com/bluesky-social/indigo v0.0.0-20250324232632-bfa8774169b8 h1:InxvAvV89uNjl0865d7hNJy4yZt5gW5L8QNjrwl8QN4=
+github.com/bluesky-social/indigo v0.0.0-20250324232632-bfa8774169b8/go.mod h1:NVBwZvbBSa93kfyweAmKwOLYawdVHdwZ9s+GZtBBVLA=
 github.com/bmizerany/assert v0.0.0-20160611221934-b7ed37b82869 h1:DDGfHa7BWjL4YnC6+E63dPcxHo2sUxDIu8g3QgEJdRY=
 github.com/bmizerany/assert v0.0.0-20160611221934-b7ed37b82869/go.mod h1:Ekp36dRnpXw/yCqJaO+ZrUyxD+3VXMFFr56k5XYrpB4=
 github.com/carlmjohnson/versioninfo v0.22.5 h1:O00sjOLUAFxYQjlN/bzYTuZiS0y6fWDQjMRvwtKgwwc=
