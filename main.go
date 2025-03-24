@@ -147,34 +147,6 @@ func main() {
 
 		useBigQuery := cctx.Bool("enable-bigquery-backend")
 
-		var bfstore backfill.Store
-		if db.Dialector.Name() == "postgres" {
-			pool, err := pgxpool.New(context.TODO(), cctx.String("db-url"))
-			if err != nil {
-				return err
-			}
-
-			if err := pool.Ping(context.TODO()); err != nil {
-				return err
-			}
-
-			pgxstore, err := NewPgxStore(pool)
-			if err != nil {
-				return err
-			}
-			bfstore = pgxstore
-
-			if err := pgxstore.LoadJobs(context.TODO()); err != nil {
-				return err
-			}
-		} else {
-			gstore := backfill.NewGormstore(db)
-			if err := gstore.LoadJobs(context.TODO()); err != nil {
-				return err
-			}
-			bfstore = gstore
-		}
-
 		lpuc, _ := lru.New[uint, time.Time](500_000)
 
 		s := &Server{
@@ -185,7 +157,35 @@ func main() {
 			skipAggregations:  cctx.Bool("skip-aggregations"),
 		}
 
+		var bfstore backfill.Store
 		if useBigQuery {
+			if db.Dialector.Name() == "postgres" {
+				pool, err := pgxpool.New(context.TODO(), cctx.String("db-url"))
+				if err != nil {
+					return err
+				}
+
+				if err := pool.Ping(context.TODO()); err != nil {
+					return err
+				}
+
+				pgxstore, err := NewPgxStore(pool)
+				if err != nil {
+					return err
+				}
+				bfstore = pgxstore
+
+				if err := pgxstore.LoadJobs(context.TODO()); err != nil {
+					return err
+				}
+			} else {
+				gstore := backfill.NewGormstore(db)
+				if err := gstore.LoadJobs(context.TODO()); err != nil {
+					return err
+				}
+				bfstore = gstore
+			}
+
 			auth := cctx.String("bigquery-auth")
 			if auth == "" {
 				return fmt.Errorf("must specify bigquery-auth")
@@ -245,12 +245,27 @@ func main() {
 			pc, _ := lru.New2Q[string, cachedPostInfo](5_000_000)
 			revc, _ := lru.New2Q[uint, string](1_000_000)
 
-			pool, err := pgxpool.New(context.TODO(), cctx.String("db-url"))
+			cfg, err := pgxpool.ParseConfig(cctx.String("db-url"))
+			if err != nil {
+				return err
+			}
+
+			pool, err := pgxpool.NewWithConfig(context.TODO(), cfg)
 			if err != nil {
 				return err
 			}
 
 			if err := pool.Ping(context.TODO()); err != nil {
+				return err
+			}
+
+			pgxstore, err := NewPgxStore(pool)
+			if err != nil {
+				return err
+			}
+			bfstore = pgxstore
+
+			if err := pgxstore.LoadJobs(context.TODO()); err != nil {
 				return err
 			}
 
@@ -264,22 +279,11 @@ func main() {
 				pgx:           pool,
 			}
 
-			/*
-				np, err := pgb.aggregateCounts()
-				if err != nil {
-					slog.Error("failed to aggregate counts", "err", err)
-				}
-
-				fmt.Println("finished aggregations: ", np)
-				return nil
-			*/
-
 			if !s.skipAggregations {
 				go pgb.runCountAggregator()
 			}
 
 			s.backend = pgb
-
 		}
 
 		ctx := context.TODO()
