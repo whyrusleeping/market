@@ -1114,10 +1114,48 @@ func (b *PostgresBackend) checkPostExists(ctx context.Context, repo *Repo, rkey 
 }
 
 func (b *PostgresBackend) doPostCreate(ctx context.Context, p *Post) error {
-	if err := b.db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "author"}, {Name: "rkey"}},
-		DoUpdates: clause.AssignmentColumns([]string{"cid", "not_found", "raw", "created", "indexed"}),
-	}).Create(p).Error; err != nil {
+	/*
+		if err := b.db.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "author"}, {Name: "rkey"}},
+			DoUpdates: clause.AssignmentColumns([]string{"cid", "not_found", "raw", "created", "indexed"}),
+		}).Create(p).Error; err != nil {
+			return err
+		}
+	*/
+
+	query := `
+INSERT INTO posts (author, rkey, cid, not_found, raw, created, indexed, reposting, reply_to, reply_to_usr, in_thread) 
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+ON CONFLICT (author, rkey) 
+DO UPDATE SET 
+    cid = $3,
+    not_found = $4,
+    raw = $5,
+    created = $6,
+    indexed = $7,
+    reposting = $8,
+    reply_to = $9,
+    reply_to_usr = $10,
+    in_thread = $11
+RETURNING id
+`
+
+	// Execute the query with parameters from the Post struct
+	if err := b.pgx.QueryRow(
+		ctx,
+		query,
+		p.Author,
+		p.Rkey,
+		p.Cid,
+		p.NotFound,
+		p.Raw,
+		p.Created,
+		p.Indexed,
+		p.Reposting,
+		p.ReplyTo,
+		p.ReplyToUsr,
+		p.InThread,
+	).Scan(&p.ID); err != nil {
 		return err
 	}
 
@@ -1295,7 +1333,8 @@ func (b *PostgresBackend) HandleCreateLike(ctx context.Context, repo *Repo, rkey
 	}
 
 	if err := b.db.Exec(`INSERT INTO "likes" ("created","indexed","author","rkey","subject") VALUES (?,?,?,?,?)`, created.Time(), time.Now(), repo.ID, rkey, pid).Error; err != nil {
-		if errors.Is(err, gorm.ErrDuplicatedKey) {
+		pgErr, ok := err.(*pgconn.PgError)
+		if ok && pgErr.Code == "23505" {
 			return nil
 		}
 		return err
@@ -1339,13 +1378,11 @@ func (b *PostgresBackend) HandleCreateRepost(ctx context.Context, repo *Repo, rk
 		return fmt.Errorf("getting repost subject: %w", err)
 	}
 
-	if err := b.db.Create(&Repost{
-		Created: created.Time(),
-		Indexed: time.Now(),
-		Author:  repo.ID,
-		Rkey:    rkey,
-		Subject: pid,
-	}).Error; err != nil {
+	if _, err := b.pgx.Exec(ctx, `INSERT INTO "reposts" ("created","indexed","author","rkey","subject") VALUES ($1, $2, $3, $4, $5)`, created.Time(), time.Now(), repo.ID, rkey, pid); err != nil {
+		pgErr, ok := err.(*pgconn.PgError)
+		if ok && pgErr.Code == "23505" {
+			return nil
+		}
 		return err
 	}
 
