@@ -227,7 +227,7 @@ func (s *Pgxstore) createJobForRepo(repo, state string) error {
 	}
 
 	j := &Pgxjob{
-		//repo:  repo,
+		repo:  repo,
 		state: state,
 
 		jobID: idout,
@@ -307,7 +307,7 @@ func (s *Pgxstore) loadJob(ctx context.Context, repo string) (*Pgxjob, error) {
 	}
 
 	j := &Pgxjob{
-		//repo:       repo,
+		repo:       repo,
 		retryAfter: retryAt,
 
 		jobID: jobid,
@@ -316,6 +316,9 @@ func (s *Pgxstore) loadJob(ctx context.Context, repo string) (*Pgxjob, error) {
 	}
 	if state != nil {
 		j.state = *state
+	}
+	if rev != nil {
+		j.rev = *rev
 	}
 	if retryCount != nil {
 		j.retryCount = *retryCount
