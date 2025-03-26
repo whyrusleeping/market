@@ -1156,6 +1156,14 @@ type PostgresBackend struct {
 }
 
 func (b *PostgresBackend) Flush(ctx context.Context) error {
+	if b.batchingEnabled {
+		if b.likeBatch.Len() > 0 {
+			res := b.pgx.SendBatch(ctx, b.likeBatch)
+			if err := res.Close(); err != nil {
+				slog.Error("failed to send final like batch", "error", err)
+			}
+		}
+	}
 	return nil
 }
 
