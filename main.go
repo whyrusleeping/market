@@ -23,6 +23,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pixiv/go-libjpeg/jpeg"
 
@@ -46,6 +47,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/urfave/cli/v2"
+	"github.com/whyrusleeping/market/halfvec"
 	. "github.com/whyrusleeping/market/models"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -66,6 +68,12 @@ var doEmbedHist = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Help:    "A histogram of embedding computation time",
 	Buckets: prometheus.ExponentialBucketsRange(0.001, 30, 20),
 }, []string{"model"})
+
+var embeddingTimeHist = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "embed_timing",
+	Help:    "A histogram of embedding computation time",
+	Buckets: prometheus.ExponentialBucketsRange(0.001, 30, 20),
+}, []string{"model", "phase"})
 
 var firehoseCursorGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "firehose_cursor",
@@ -129,6 +137,9 @@ func main() {
 		&cli.IntFlag{
 			Name:  "post-cache-size",
 			Value: 5_000_000,
+		},
+		&cli.StringSliceFlag{
+			Name: "embed-backend",
 		},
 	}
 	app.Action = func(cctx *cli.Context) error {
@@ -297,13 +308,43 @@ func main() {
 			pgb, ok := s.backend.(*PostgresBackend)
 			if !ok {
 				return fmt.Errorf("can only use embedding service with postgres backend")
-
 			}
-			es := NewEmbStore(pgb.db, embserv, s, pgb)
+
+			config, err := pgxpool.ParseConfig(cctx.String("db-url"))
+			if err != nil {
+				log.Fatalf("Unable to parse pool config: %v\n", err)
+			}
+
+			vectorOID := uint32(616049)
+			config.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+				conn.TypeMap().RegisterType(&pgtype.Type{
+					Name:  "halfvec",
+					OID:   vectorOID,
+					Codec: &halfvec.VectorCodec{},
+				})
+				return nil
+			}
+
+			pgxpool, err := pgxpool.NewWithConfig(ctx, config)
+			if err != nil {
+				return err
+			}
+
+			es := NewEmbStore(pgb.db, pgxpool, embserv, s, pgb)
 			s.embeddings = es
 
 			lpuc, _ := lru.New[uint, time.Time](500_000)
 			s.lastProfileUpdate = lpuc
+
+			if embedBackends := cctx.StringSlice("embed-backend"); len(embedBackends) > 0 {
+				for _, bes := range embedBackends {
+					parts := strings.Split(bes, "@")
+					es.embedBackends = append(es.embedBackends, embedBackendConfig{
+						Host: parts[0],
+						Key:  parts[1],
+					})
+				}
+			}
 		}
 
 		curs, err := s.LoadCursor(ctx)
@@ -1316,7 +1357,7 @@ func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey
 	})
 
 	if b.s.embeddings != nil {
-		if err := b.s.embeddings.CreatePostEmbedding(ctx, repo, p.ID, &rec); err != nil {
+		if err := b.s.embeddings.CreatePostEmbedding(ctx, repo, &p, &rec); err != nil {
 			slog.Error("failed to create post embedding", "did", repo.Did, "post_id", p.ID, "error", err)
 		} else {
 			if err := b.s.embeddings.CreateOrUpdateUserEmbedding(ctx, repo); err != nil {
@@ -2221,6 +2262,8 @@ func (s *Server) uriForImage(did, cid, kind string) (string, error) {
 }
 
 func (s *Server) batchCacheImages(dir string, images []string) []bool {
+	ctx := context.TODO()
+
 	n := 30
 	sema := make(chan bool, n)
 
@@ -2231,7 +2274,7 @@ func (s *Server) batchCacheImages(dir string, images []string) []bool {
 			defer func() {
 				<-sema
 			}()
-			if err := s.maybeFetchImage(uri, dir); err != nil {
+			if err := s.maybeFetchImage(ctx, uri, dir); err != nil {
 				fmt.Printf("image fetch failed (%s): %s\n", uri, err)
 			} else {
 				results[i] = true
@@ -2246,7 +2289,10 @@ func (s *Server) batchCacheImages(dir string, images []string) []bool {
 	return results
 }
 
-func (s *Server) maybeFetchImage(uri string, dir string) error {
+func (s *Server) maybeFetchImage(ctx context.Context, uri string, dir string) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
+	defer cancel()
+
 	parts := strings.Split(uri, "/")
 	endbit := parts[len(parts)-1]
 	cidpart := strings.Split(endbit, "@")[0]
@@ -2272,6 +2318,8 @@ func (s *Server) maybeFetchImage(uri string, dir string) error {
 	if err != nil {
 		return err
 	}
+
+	req = req.WithContext(ctx)
 
 	if rlbypass := os.Getenv("BSKY_RATELIMITBYPASS"); rlbypass != "" {
 		req.Header.Set("x-ratelimit-bypass", rlbypass)
@@ -2362,12 +2410,21 @@ func (s *Server) putImageToCache(cc string, b []byte) error {
 	}
 }
 
-func (s *Server) getImageFromCache(did, cc string, w io.Writer, doresize bool) error {
+func (s *Server) getImageFromCache(ctx context.Context, did, cc string, w io.Writer, doresize bool) error {
 	if s.imageCacheServer != "" {
-		resp, err := http.Get(s.imageCacheServer + "/" + cc)
+		ctx, cancel := context.WithTimeout(ctx, time.Second*5)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, "GET", s.imageCacheServer+"/"+cc, nil)
 		if err != nil {
 			return err
 		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return err
+		}
+
 		defer resp.Body.Close()
 
 		if resp.StatusCode != 200 {
@@ -2644,15 +2701,16 @@ func (s *Server) handleServeImage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	ctx := r.Context()
 
-	if err := s.maybeFetchImage(uri, s.imageCacheDir); err != nil {
+	if err := s.maybeFetchImage(ctx, uri, s.imageCacheDir); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 
 	w.Header().Add("Content-Type", img.Mime)
 
-	if err := s.getImageFromCache(did, cc, w, doresize); err != nil {
+	if err := s.getImageFromCache(ctx, did, cc, w, doresize); err != nil {
 		http.Error(w, err.Error(), 500)
 	}
 }

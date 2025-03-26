@@ -13,7 +13,7 @@ require (
 	github.com/ipfs/go-cid v0.4.1
 	github.com/jackc/pgx/v5 v5.6.0
 	github.com/nfnt/resize v0.0.0-20180221191011-83c6a9932646
-	github.com/pgvector/pgvector-go v0.2.3
+	github.com/pgvector/pgvector-go v0.2.4-0.20250217033638-add6c05e28d9
 	github.com/pixiv/go-libjpeg v0.0.0-20190822045933-3da21a74767d
 	github.com/prometheus/client_golang v1.19.1
 	github.com/urfave/cli/v2 v2.27.2
