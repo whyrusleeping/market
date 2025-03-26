@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"sync"
@@ -633,29 +634,38 @@ func (s *embStore) pushClusterUpdate(ctx context.Context, be embedBackendConfig,
 		return err
 	}
 
-	req, err := http.NewRequest("POST", be.Host+"/admin/clusterUpdates", bytes.NewReader(b))
-	if err != nil {
-		return err
+	for i := 0; i < 5; i++ {
+		req, err := http.NewRequest("POST", be.Host+"/admin/clusterUpdates", bytes.NewReader(b))
+		if err != nil {
+			return err
+		}
+
+		req.Header.Add("Content-Type", "application/json")
+
+		req.Header.Set("Authorization", "Bearer "+be.Key)
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			if i == 4 {
+				return err
+			}
+			slog.Error("failed to perform http request to cluster updates endpoint", "error", err)
+			time.Sleep(time.Second*time.Duration(i) + (time.Duration(rand.IntN(2000)) * time.Millisecond))
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			bb, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("non-200 status code from cluster update: %d - %s", resp.StatusCode, string(bb))
+		}
+
+		io.Copy(io.Discard, resp.Body)
+
+		return nil
 	}
 
-	req.Header.Add("Content-Type", "application/json")
-
-	req.Header.Set("Authorization", "Bearer "+be.Key)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		bb, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("non-200 status code from cluster update: %d - %s", resp.StatusCode, string(bb))
-	}
-
-	io.Copy(io.Discard, resp.Body)
-
-	return nil
+	return fmt.Errorf("failed to make successful request")
 }
 
 func readEmbeddingRows(rows pgx.Rows) ([]halfvec.HalfVector, string, error) {

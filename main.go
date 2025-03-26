@@ -141,6 +141,9 @@ func main() {
 		&cli.StringSliceFlag{
 			Name: "embed-backend",
 		},
+		&cli.BoolFlag{
+			Name: "batching",
+		},
 	}
 	app.Action = func(cctx *cli.Context) error {
 
@@ -286,13 +289,15 @@ func main() {
 			}
 
 			pgb := &PostgresBackend{
-				s:             s,
-				bfstore:       bfstore,
-				db:            db,
-				postInfoCache: pc,
-				repoCache:     rc,
-				revCache:      revc,
-				pgx:           pool,
+				s:               s,
+				bfstore:         bfstore,
+				db:              db,
+				postInfoCache:   pc,
+				repoCache:       rc,
+				revCache:        revc,
+				pgx:             pool,
+				batchingEnabled: cctx.Bool("batching"),
+				likeBatch:       new(pgx.Batch),
 			}
 
 			if !s.skipAggregations {
@@ -1144,6 +1149,10 @@ type PostgresBackend struct {
 	reposLk   sync.Mutex
 
 	postInfoCache *lru.TwoQueueCache[string, cachedPostInfo]
+
+	batchingEnabled bool
+	batchLk         sync.Mutex
+	likeBatch       *pgx.Batch
 }
 
 func (b *PostgresBackend) Flush(ctx context.Context) error {
@@ -1341,7 +1350,7 @@ func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey
 		}
 	}
 
-	if len(images) > 0 {
+	if len(images) > 0 && b.s.imagesEnabled() {
 		for _, img := range images {
 			img.Post = p.ID
 		}
@@ -1385,14 +1394,36 @@ func (b *PostgresBackend) HandleCreateLike(ctx context.Context, repo *Repo, rkey
 		return fmt.Errorf("getting like subject: %w", err)
 	}
 
-	if _, err := b.pgx.Exec(ctx, `INSERT INTO "likes" ("created","indexed","author","rkey","subject") VALUES ($1, $2, $3, $4, $5)`, created.Time(), time.Now(), repo.ID, rkey, pid); err != nil {
-		pgErr, ok := err.(*pgconn.PgError)
-		if ok && pgErr.Code == "23505" {
-			return nil
+	if b.batchingEnabled {
+		b.batchLk.Lock()
+		b.likeBatch.Queue(`INSERT INTO "likes" ("created","indexed","author","rkey","subject") VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING`, created.Time(), time.Now(), repo.ID, rkey, pid)
+
+		if b.likeBatch.Len() > 1000 {
+			batch := b.likeBatch
+			b.likeBatch = new(pgx.Batch)
+			b.batchLk.Unlock()
+
+			res := b.pgx.SendBatch(ctx, batch)
+
+			// I guess we could handle each like creation conflict error here? seems complicated and i'm a bit lazy right now
+			if err := res.Close(); err != nil {
+				slog.Error("batch like creation failed", "error", err)
+			}
+
+		} else {
+			b.batchLk.Unlock()
 		}
-		return err
+	} else {
+		if _, err := b.pgx.Exec(ctx, `INSERT INTO "likes" ("created","indexed","author","rkey","subject") VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING`, created.Time(), time.Now(), repo.ID, rkey, pid); err != nil {
+			pgErr, ok := err.(*pgconn.PgError)
+			if ok && pgErr.Code == "23505" {
+				return nil
+			}
+			return err
+		}
 	}
 
+	// TODO: if batching and have duplicate like creations, our aggregation counts will be incorrect
 	if !b.s.skipAggregations {
 		if err := b.db.Create(&PostCountsTask{
 			Post: pid,
