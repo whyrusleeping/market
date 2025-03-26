@@ -1422,7 +1422,7 @@ func (b *PostgresBackend) HandleCreateLike(ctx context.Context, repo *Repo, rkey
 			b.batchLk.Unlock()
 		}
 	} else {
-		if _, err := b.pgx.Exec(ctx, `INSERT INTO "likes" ("created","indexed","author","rkey","subject") VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING`, created.Time(), time.Now(), repo.ID, rkey, pid); err != nil {
+		if _, err := b.pgx.Exec(ctx, `INSERT INTO "likes" ("created","indexed","author","rkey","subject") VALUES ($1, $2, $3, $4, $5)`, created.Time(), time.Now(), repo.ID, rkey, pid); err != nil {
 			pgErr, ok := err.(*pgconn.PgError)
 			if ok && pgErr.Code == "23505" {
 				return nil
@@ -1506,18 +1506,23 @@ func (b *PostgresBackend) HandleCreateFollow(ctx context.Context, repo *Repo, rk
 		return err
 	}
 
-	if err := b.db.Create(&Follow{
-		Created: created.Time(),
-		Indexed: time.Now(),
-		Author:  repo.ID,
-		Rkey:    rkey,
-		Subject: subj.ID,
-	}).Error; err != nil {
-		if errors.Is(err, gorm.ErrDuplicatedKey) {
-			return nil
-		}
+	if _, err := b.pgx.Exec(ctx, "INSERT INTO follows (created, indexed, author, rkey, subject) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING", created.Time(), time.Now(), repo.ID, rkey, subj.ID); err != nil {
 		return err
 	}
+	/*
+		if err := b.db.Create(&Follow{
+			Created: created.Time(),
+			Indexed: time.Now(),
+			Author:  repo.ID,
+			Rkey:    rkey,
+			Subject: subj.ID,
+		}).Error; err != nil {
+			if errors.Is(err, gorm.ErrDuplicatedKey) {
+				return nil
+			}
+			return err
+		}
+	*/
 
 	return nil
 }
