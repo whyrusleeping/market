@@ -1320,24 +1320,28 @@ func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey
 
 			p.Reposting = rp
 
-			postCountTasks = append(postCountTasks, &PostCountsTask{
-				Post: rp,
-				Op:   "quote",
-				Val:  1,
-			})
+			if !b.s.skipAggregations {
+				postCountTasks = append(postCountTasks, &PostCountsTask{
+					Post: rp,
+					Op:   "quote",
+					Val:  1,
+				})
+			}
 		}
 
-		if rec.Embed.EmbedImages != nil {
-			for _, img := range rec.Embed.EmbedImages.Images {
-				if img.Image == nil {
-					slog.Error("image had nil blob", "author", repo.ID, "rkey", rkey)
-					continue
+		if b.s.imagesEnabled() {
+			if rec.Embed.EmbedImages != nil {
+				for _, img := range rec.Embed.EmbedImages.Images {
+					if img.Image == nil {
+						slog.Error("image had nil blob", "author", repo.ID, "rkey", rkey)
+						continue
+					}
+					images = append(images, &Image{
+						Cid:  img.Image.Ref.String(),
+						Did:  repo.Did,
+						Mime: img.Image.MimeType,
+					})
 				}
-				images = append(images, &Image{
-					Cid:  img.Image.Ref.String(),
-					Did:  repo.Did,
-					Mime: img.Image.MimeType,
-				})
 			}
 		}
 	}
@@ -1346,13 +1350,12 @@ func (b *PostgresBackend) HandleCreatePost(ctx context.Context, repo *Repo, rkey
 		return err
 	}
 
-	if len(postCountTasks) > 0 && !b.s.skipAggregations {
-		if err := b.db.Create(postCountTasks).Error; err != nil {
-			return err
-		}
-	}
-
 	if !b.s.skipAggregations {
+		if len(postCountTasks) > 0 {
+			if err := b.db.Create(postCountTasks).Error; err != nil {
+				return err
+			}
+		}
 		if err := b.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&PostCounts{Post: p.ID}).Error; err != nil {
 			return err
 		}
