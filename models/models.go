@@ -77,6 +77,14 @@ type Like struct {
 	Subject uint
 }
 
+type LikedReply struct {
+	ID          uint      `gorm:"primarykey"`
+	Created     time.Time `gorm:"index:,sort:desc"`
+	Reply       uint
+	ReplyAuthor uint
+	Op          uint
+}
+
 type Repost struct {
 	ID      uint `gorm:"primarykey"`
 	Created time.Time

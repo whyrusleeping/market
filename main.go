@@ -255,6 +255,7 @@ func main() {
 			db.AutoMigrate(Image{})
 			db.AutoMigrate(PostGate{})
 			db.AutoMigrate(StarterPack{})
+			db.AutoMigrate(LikedReply{})
 
 			rc, _ := lru.New2Q[string, *Repo](1_000_000)
 			pc, _ := lru.New2Q[string, cachedPostInfo](cctx.Int("post-cache-size"))
@@ -302,6 +303,7 @@ func main() {
 
 			if !s.skipAggregations {
 				go pgb.runCountAggregator()
+				go pgb.runLikedReplyBatcher()
 			}
 
 			s.backend = pgb
@@ -360,7 +362,7 @@ func main() {
 		go s.syncCursorRoutine()
 
 		if s.imagesEnabled() && !useBigQuery {
-			go s.imageFetcher()
+			//go s.imageFetcher()
 		}
 
 		opts := backfill.DefaultBackfillOptions()
@@ -719,6 +721,56 @@ func sleepForWorksize(np int) {
 	case np < 1000:
 		time.Sleep(time.Second)
 	}
+}
+
+func sleepForWorksizeLrc(np int64) {
+	switch {
+	case np == 0:
+		time.Sleep(time.Minute)
+	case np < 10000:
+		time.Sleep(time.Second * 30)
+	default:
+		time.Sleep(time.Second)
+	}
+}
+
+func (b *PostgresBackend) runLikedReplyBatcher() {
+	for {
+		n, err := b.batchLikedReplies(context.TODO())
+		if err != nil {
+			slog.Error("failed batch liked replies", "error", err)
+		}
+
+		sleepForWorksizeLrc(n)
+	}
+}
+
+func (b *PostgresBackend) batchLikedReplies(ctx context.Context) (int64, error) {
+	var oldest time.Time
+	if err := b.pgx.QueryRow(ctx, "SELECT created FROM liked_replies ORDER BY created DESC LIMIT 1").Scan(&oldest); err != nil {
+		if err != pgx.ErrNoRows {
+			return 0, fmt.Errorf("failed to get latest liked reply created: %w", err)
+		}
+
+		oldest = time.Now().Add(time.Hour * 5 * -24)
+	}
+
+	newest := oldest.Add(time.Hour)
+
+	tag, err := b.pgx.Exec(context.TODO(), `INSERT INTO liked_replies (op, reply, reply_author, created)
+			SELECT
+				likes.author as op, 
+				likes.subject as reply,
+				posts.author as reply_author,
+				likes.created as created
+			FROM likes 
+				INNER JOIN posts ON posts.id = likes.subject
+			WHERE likes.author = posts.reply_to_usr AND likes.created > $1 AND likes.created < $2`, oldest, newest)
+	if err != nil {
+		return 0, err
+	}
+
+	return tag.RowsAffected(), nil
 }
 
 func (b *PostgresBackend) runCountAggregator() {

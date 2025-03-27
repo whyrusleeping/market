@@ -43,6 +43,8 @@ type embStore struct {
 	bufferedUserEmbUpdates *addEmbeddingsBody
 
 	clusterMappingsCache *lru.Cache[uint, *cachedClusterInfo]
+
+	postUriCache *lru.TwoQueueCache[uint, string]
 }
 
 type embedBackendConfig struct {
@@ -53,6 +55,7 @@ type embedBackendConfig struct {
 func NewEmbStore(db *gorm.DB, pgxdb *pgxpool.Pool, embserv string, s *Server, b *PostgresBackend) *embStore {
 	c, _ := lru.New2Q[string, []byte](100_000)
 	cmc, _ := lru.New[uint, *cachedClusterInfo](300_000)
+	puc, _ := lru.New2Q[uint, string](500_000)
 	return &embStore{
 		db:                     db,
 		pgxdb:                  pgxdb,
@@ -62,6 +65,7 @@ func NewEmbStore(db *gorm.DB, pgxdb *pgxpool.Pool, embserv string, s *Server, b 
 		profileImageCache:      c,
 		bufferedClusterUpdates: make(map[string]*clusterInfoWeights),
 		clusterMappingsCache:   cmc,
+		postUriCache:           puc,
 	}
 }
 
@@ -95,6 +99,9 @@ type postEmbedBody struct {
 	ReplyType       string         `json:"reply_type"`
 	AuthorEmbedding *Embedding     `json:"author_embedding"`
 	ParentEmbedding *Embedding     `json:"parent_embedding"`
+	Uri             string         `json:"uri"`
+	AuthorDid       string         `json:"author_did"`
+	ParentUri       string         `json:"parent_uri,omitempty"`
 }
 
 type Embedding struct {
@@ -164,7 +171,7 @@ func (s *embStore) CreatePostEmbedding(ctx context.Context, repo *Repo, p *Post,
 	defer func() {
 		doEmbedHist.WithLabelValues("post").Observe(time.Since(start).Seconds())
 	}()
-	emb, err := s.computePostEmbedding(ctx, repo, fp)
+	emb, err := s.computePostEmbedding(ctx, repo, p, fp)
 	if err != nil {
 		return err
 	}
@@ -186,7 +193,7 @@ func (s *embStore) CreatePostEmbedding(ctx context.Context, repo *Repo, p *Post,
 	return nil
 }
 
-func (s *embStore) computePostEmbedding(ctx context.Context, r *Repo, fp *bsky.FeedPost) (*Embedding, error) {
+func (s *embStore) computePostEmbedding(ctx context.Context, r *Repo, p *Post, fp *bsky.FeedPost) (*Embedding, error) {
 	var postPrep time.Time
 	start := time.Now()
 
@@ -207,6 +214,8 @@ func (s *embStore) computePostEmbedding(ctx context.Context, r *Repo, fp *bsky.F
 		Post:            fp,
 		AuthorEmbedding: authorEmb,
 		ReplyType:       "root",
+		AuthorDid:       r.Did,
+		Uri:             "at://" + r.Did + "/app.bsky.feed.post/" + p.Rkey,
 	}
 
 	if fp.Reply != nil && fp.Reply.Parent != nil {
@@ -218,6 +227,7 @@ func (s *embStore) computePostEmbedding(ctx context.Context, r *Repo, fp *bsky.F
 		if parentEmb != nil {
 			peb.ParentEmbedding = parentEmb
 			peb.ReplyType = "reply"
+			peb.ParentUri = fp.Reply.Parent.Uri
 		}
 	}
 
@@ -362,18 +372,18 @@ func (s *embStore) CreateOrUpdateUserEmbedding(ctx context.Context, r *Repo) err
 		}
 	}
 
-	recentInteractions, err := s.getRecentUserInteractions(ctx, r)
+	recentInteractions, uris, err := s.getRecentUserInteractions(ctx, r)
 	if err != nil {
-		return err
+		return fmt.Errorf("get recent user interactions: %w", err)
 	}
 
 	interactions := averageEmbeddings(recentInteractions)
 
 	postPrep = time.Now()
 
-	emb, err := s.computeUserEmbedding(ctx, "", pfpBytes, headerBytes, description, name, interactions)
+	emb, err := s.computeUserEmbedding(ctx, "", pfpBytes, headerBytes, description, name, interactions, uris)
 	if err != nil {
-		return err
+		return fmt.Errorf("computing embedding: %w", err)
 	}
 
 	if err := s.db.Clauses(clause.OnConflict{
@@ -403,7 +413,6 @@ func (s *embStore) CreateOrUpdateUserEmbedding(ctx context.Context, r *Repo) err
 			if err := s.pushRemoteUserEmbedding(ctx, be, r, emb); err != nil {
 				slog.Error("failed to push remote embedding", "did", r.Did, "error", err)
 			}
-
 		}(be)
 	}
 
@@ -686,7 +695,25 @@ func readEmbeddingRows(rows pgx.Rows) ([]halfvec.HalfVector, string, error) {
 	return vals, model, nil
 }
 
-func (s *embStore) getRecentUserInteractions(ctx context.Context, r *Repo) ([]Embedding, error) {
+func (s *embStore) uriForPostID(ctx context.Context, pid uint) (string, error) {
+	val, ok := s.postUriCache.Get(pid)
+	if ok {
+		return val, nil
+	}
+
+	var did, rkey string
+	if err := s.pgxdb.QueryRow(ctx, "SELECT (SELECT did FROM repos WHERE id = posts.author) as did, rkey FROM posts WHERE id = $1", pid).Scan(&did, &rkey); err != nil {
+		return "", err
+	}
+
+	uri := "at://" + did + "/app.bsky.feed.post/" + rkey
+
+	s.postUriCache.Add(pid, uri)
+
+	return uri, nil
+}
+
+func (s *embStore) getRecentUserInteractions(ctx context.Context, r *Repo) ([]Embedding, []string, error) {
 	/*
 		rows, err := s.pgxdb.Query(ctx, "SELECT embedding, model FROM post_embeddings WHERE post IN (SELECT id FROM posts WHERE author = ? ORDER BY posts.rkey DESC limit 15)", r.ID)
 		if err != nil {
@@ -700,7 +727,7 @@ func (s *embStore) getRecentUserInteractions(ctx context.Context, r *Repo) ([]Em
 	*/
 	var posts []postEmbedding
 	if err := s.db.Raw("SELECT * FROM post_embeddings WHERE post IN (SELECT id FROM posts WHERE author = ? ORDER BY posts.rkey DESC limit 15)", r.ID).Scan(&posts).Error; err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	/*
@@ -717,7 +744,7 @@ func (s *embStore) getRecentUserInteractions(ctx context.Context, r *Repo) ([]Em
 	*/
 	var likedPosts []postEmbedding
 	if err := s.db.Raw("SELECT * FROM post_embeddings WHERE post IN (SELECT subject FROM likes WHERE likes.author = ? ORDER BY likes.rkey DESC limit 15)", r.ID).Scan(&likedPosts).Error; err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if len(posts) > 10 {
@@ -728,8 +755,14 @@ func (s *embStore) getRecentUserInteractions(ctx context.Context, r *Repo) ([]Em
 		likedPosts = likedPosts[:10]
 	}
 
+	var uris []string
 	var out []Embedding
 	for _, emb := range posts {
+		puri, err := s.uriForPostID(ctx, emb.Post)
+		if err != nil {
+			return nil, nil, err
+		}
+		uris = append(uris, puri)
 		out = append(out, Embedding{
 			Vector:  emb.Embedding.Slice(),
 			ModelID: emb.Model,
@@ -737,13 +770,18 @@ func (s *embStore) getRecentUserInteractions(ctx context.Context, r *Repo) ([]Em
 	}
 
 	for _, emb := range likedPosts {
+		puri, err := s.uriForPostID(ctx, emb.Post)
+		if err != nil {
+			return nil, nil, err
+		}
+		uris = append(uris, puri)
 		out = append(out, Embedding{
 			Vector:  emb.Embedding.Slice(),
 			ModelID: emb.Model,
 		})
 	}
 
-	return out, nil
+	return out, uris, nil
 }
 
 // averageEmbeddings calculates the element-wise average of multiple embeddings using SIMD when available
@@ -793,9 +831,10 @@ type userEmbedBody struct {
 	Description        string      `json:"description"`
 	Name               string      `json:"name"`
 	RecentInteractions *Embedding  `json:"recent_interactions"`
+	Did                string      `json:"did"`
 }
 
-func (s *embStore) computeUserEmbedding(ctx context.Context, repo string, pfp, header *pictureObj, description, name string, interactions *Embedding) (*Embedding, error) {
+func (s *embStore) computeUserEmbedding(ctx context.Context, repo string, pfp, header *pictureObj, description, name string, interactions *Embedding, interuri []string) (*Embedding, error) {
 
 	ueb := &userEmbedBody{
 		ProfilePic:         pfp,
@@ -803,6 +842,7 @@ func (s *embStore) computeUserEmbedding(ctx context.Context, repo string, pfp, h
 		Description:        description,
 		Name:               name,
 		RecentInteractions: interactions,
+		Did:                repo,
 	}
 
 	b, err := json.Marshal(ueb)
