@@ -165,11 +165,14 @@ func main() {
 
 		useBigQuery := cctx.Bool("enable-bigquery-backend")
 
+		imgc, _ := lru.New2Q[string, []byte](20_000)
+
 		s := &Server{
 			imageCacheDir:    cctx.String("image-dir"),
 			imageCacheServer: cctx.String("image-cache-server"),
 			bfdb:             db,
 			skipAggregations: cctx.Bool("skip-aggregations"),
+			imageCache:       imgc,
 		}
 
 		var bfstore backfill.Store
@@ -510,6 +513,8 @@ type Server struct {
 	embeddings *embStore
 
 	lastProfileUpdate *lru.Cache[uint, time.Time]
+
+	imageCache *lru.TwoQueueCache[string, []byte]
 }
 
 func (s *Server) imagesEnabled() bool {
@@ -2450,6 +2455,8 @@ func (s *Server) maybeFetchImage(ctx context.Context, uri string, dir string) er
 }
 
 func (s *Server) imageIsCached(cc string) (bool, error) {
+	return s.imageCache.Contains(cc), nil
+
 	if s.imageCacheServer != "" {
 		resp, err := http.Head(s.imageCacheServer + "/" + cc)
 		if err != nil {
@@ -2478,6 +2485,10 @@ func (s *Server) imageIsCached(cc string) (bool, error) {
 }
 
 func (s *Server) putImageToCache(cc string, b []byte) error {
+	s.imageCache.Add(cc, b)
+
+	return nil
+
 	if s.imageCacheServer != "" {
 		resp, err := http.Post(s.imageCacheServer+"/"+cc, "application/octet-stream", bytes.NewReader(b))
 		if err != nil {
@@ -2510,6 +2521,35 @@ func (s *Server) putImageToCache(cc string, b []byte) error {
 }
 
 func (s *Server) getImageFromCache(ctx context.Context, did, cc string, w io.Writer, doresize bool) error {
+	b, ok := s.imageCache.Get(cc)
+	if !ok {
+		return fmt.Errorf("image missing from cache")
+	}
+
+	if doresize {
+		img, err := jpeg.Decode(bytes.NewReader(b), &jpeg.DecoderOptions{
+			ScaleTarget: image.Rectangle{
+				Max: image.Point{
+					X: 224,
+					Y: 224,
+				},
+			},
+		})
+		if err != nil {
+			return err
+		}
+
+		//fmt.Println("Image after decoding: ", img.Bounds().Dx(), img.Bounds().Dy())
+
+		nimg := resize.Resize(224, 224, img, resize.Lanczos2)
+
+		opts := jpeg.EncoderOptions{Quality: 75}
+		return jpeg.Encode(w, nimg, &opts)
+	}
+
+	w.Write(b)
+
+	return nil
 	if s.imageCacheServer != "" {
 		ctx, cancel := context.WithTimeout(ctx, time.Second*5)
 		defer cancel()
