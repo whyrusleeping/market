@@ -254,7 +254,10 @@ func (s *embStore) computePostEmbedding(ctx context.Context, r *Repo, p *Post, f
 		return nil, err
 	}
 
-	req, err := http.NewRequest("POST", s.embeddingServer+"/embed/post", bytes.NewReader(b))
+	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", s.embeddingServer+"/embed/post", bytes.NewReader(b))
 	if err != nil {
 		return nil, err
 	}
@@ -835,6 +838,8 @@ type userEmbedBody struct {
 }
 
 func (s *embStore) computeUserEmbedding(ctx context.Context, repo string, pfp, header *pictureObj, description, name string, interactions *Embedding, interuri []string) (*Embedding, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
+	defer cancel()
 
 	ueb := &userEmbedBody{
 		ProfilePic:         pfp,
@@ -850,7 +855,7 @@ func (s *embStore) computeUserEmbedding(ctx context.Context, repo string, pfp, h
 		return nil, err
 	}
 
-	req, err := http.NewRequest("POST", s.embeddingServer+"/embed/user", bytes.NewReader(b))
+	req, err := http.NewRequestWithContext(ctx, "POST", s.embeddingServer+"/embed/user", bytes.NewReader(b))
 	if err != nil {
 		return nil, err
 	}
