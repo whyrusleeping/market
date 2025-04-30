@@ -173,7 +173,7 @@ func (s *embStore) CreatePostEmbedding(ctx context.Context, repo *Repo, p *Post,
 	}()
 	emb, err := s.computePostEmbedding(ctx, repo, p, fp)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to compute emb: %w", err)
 	}
 
 	if err := s.db.Create(&postEmbedding{
@@ -207,7 +207,7 @@ func (s *embStore) computePostEmbedding(ctx context.Context, r *Repo, p *Post, f
 
 	authorEmb, err := s.loadUserEmbedding(ctx, r.ID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("loading user embedding: %w", err)
 	}
 
 	peb := &postEmbedBody{
@@ -221,7 +221,7 @@ func (s *embStore) computePostEmbedding(ctx context.Context, r *Repo, p *Post, f
 	if fp.Reply != nil && fp.Reply.Parent != nil {
 		parentEmb, err := s.loadPostEmbedding(ctx, fp.Reply.Parent.Uri)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("loading post embedding: %w", err)
 		}
 
 		if parentEmb != nil {
@@ -236,7 +236,7 @@ func (s *embStore) computePostEmbedding(ctx context.Context, r *Repo, p *Post, f
 			if img.Image != nil {
 				imgb, _, err := s.getImage(ctx, r.Did, img.Image.Ref.String(), "feed_fullsize")
 				if err != nil {
-					return nil, err
+					return nil, fmt.Errorf("getting image: %w", err)
 				}
 
 				peb.Images = append(peb.Images, &pictureObj{
@@ -266,7 +266,7 @@ func (s *embStore) computePostEmbedding(ctx context.Context, r *Repo, p *Post, f
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("embedding server errored: %w", err)
 	}
 
 	if resp.StatusCode != 200 {
