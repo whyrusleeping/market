@@ -950,6 +950,9 @@ func (s *embStore) processDeadLetterQueue(ctx context.Context, be embedBackendCo
 }
 
 func (s *embStore) refreshUserByDid(ctx context.Context, did string) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
+	defer cancel()
+
 	r, err := s.b.getOrCreateRepo(ctx, did)
 	if err != nil {
 		return err
@@ -962,6 +965,9 @@ func (s *embStore) refreshUserByDid(ctx context.Context, did string) error {
 }
 
 func (s *embStore) refreshPostEmbByUri(ctx context.Context, uri string) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
+	defer cancel()
+
 	puri, err := syntax.ParseATURI(uri)
 	if err != nil {
 		return err
