@@ -46,6 +46,8 @@ type embStore struct {
 	clusterMappingsCache *lru.Cache[uint, *cachedClusterInfo]
 
 	postUriCache *lru.TwoQueueCache[uint, string]
+
+	vectoorHost string
 }
 
 type embedBackendConfig struct {
@@ -910,7 +912,7 @@ type missingEmbsResponse struct {
 }
 
 func (s *embStore) processDeadLetterQueue(ctx context.Context, be embedBackendConfig) error {
-	req, err := http.NewRequest("GET", be.Host+"/missingEmbeddings", nil)
+	req, err := http.NewRequest("GET", s.vectoorHost+"/missingEmbeddings", nil)
 	if err != nil {
 		return err
 	}
@@ -920,12 +922,17 @@ func (s *embStore) processDeadLetterQueue(ctx context.Context, be embedBackendCo
 		return err
 	}
 
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("got non-200 status from backend for dead letter queue (%d): %s", resp.StatusCode, string(b))
+	}
+
 	var body missingEmbsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return err
 	}
 
-	slog.Warn("dead letter queue fetched")
+	slog.Info("dead letter queue sizes", "posts", len(body.Posts), "users", len(body.Users))
 	for _, p := range body.Posts {
 		if err := s.refreshPostEmbByUri(ctx, p); err != nil {
 			slog.Error("failed to refresh post emb", "uri", p, "error", err)

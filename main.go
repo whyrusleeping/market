@@ -118,6 +118,10 @@ func main() {
 		&cli.StringFlag{
 			Name: "embedding-server",
 		},
+		&cli.StringFlag{
+			Name:    "vectoor-host",
+			EnvVars: []string{"VECTOOR_HOST"},
+		},
 		&cli.BoolFlag{
 			Name:  "skip-aggregations",
 			Usage: "skip more expensive count aggregations",
@@ -355,6 +359,8 @@ func main() {
 					})
 				}
 			}
+
+			es.vectoorHost = cctx.String("vectoor-host")
 		}
 
 		curs, err := s.LoadCursor(ctx)
@@ -2419,40 +2425,47 @@ func (s *Server) maybeFetchImage(ctx context.Context, uri string, dir string) er
 		}()
 	*/
 
-	req, err := http.NewRequest("GET", uri, nil)
-	if err != nil {
-		return err
+	var lastError error
+	for i := 0; i < 3; i++ {
+		req, err := http.NewRequest("GET", uri, nil)
+		if err != nil {
+			return err
+		}
+
+		req = req.WithContext(ctx)
+
+		if rlbypass := os.Getenv("BSKY_RATELIMITBYPASS"); rlbypass != "" {
+			req.Header.Set("x-ratelimit-bypass", rlbypass)
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("fetch error: %w", err)
+		}
+
+		if resp.StatusCode != 200 {
+			lastError = fmt.Errorf("non-200 response code: %d", resp.StatusCode)
+			if resp.StatusCode == 404 {
+				return lastError
+			}
+			slog.Error("image fetch failed", "attempt", i, "error", lastError, "uri", uri)
+			time.Sleep(time.Second * time.Duration(i+1))
+			continue
+		}
+
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+
+		if err := s.putImageToCache(cidpart, data); err != nil {
+			return err
+		}
+
+		return nil
 	}
 
-	req = req.WithContext(ctx)
-
-	if rlbypass := os.Getenv("BSKY_RATELIMITBYPASS"); rlbypass != "" {
-		req.Header.Set("x-ratelimit-bypass", rlbypass)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("fetch error: %w", err)
-	}
-
-	//reqdo = time.Now()
-
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("non-200 response code: %d", resp.StatusCode)
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	//tcopy = time.Now()
-
-	if err := s.putImageToCache(cidpart, data); err != nil {
-		return err
-	}
-	//twrfile = time.Now()
-
-	return nil
+	return lastError
 }
 
 func (s *Server) imageIsCached(cc string) (bool, error) {
@@ -3000,6 +3013,7 @@ func (s *Server) handleScanMissingEmbs(w http.ResponseWriter, r *http.Request) {
 	be := s.embeddings.embedBackends[len(s.embeddings.embedBackends)-1]
 
 	if err := s.embeddings.processDeadLetterQueue(ctx, be); err != nil {
+		slog.Error("failed to process dead letter queue", "backend", be.Host, "error", err)
 		http.Error(w, err.Error(), 500)
 	}
 }
