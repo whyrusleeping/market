@@ -448,6 +448,7 @@ func main() {
 			http.HandleFunc("/reset/profile/", s.handleResetProfile)
 			http.HandleFunc("/rescan/repo/", s.handleRescanRepo)
 			http.HandleFunc("/check/repo/", s.handleCheckRepo)
+			http.HandleFunc("/check/missingembs", s.handleScanMissingEmbs)
 			http.ListenAndServe(":5151", nil)
 
 		}()
@@ -2932,4 +2933,14 @@ func (s *Server) indexImagesInPost(p *Post) error {
 	}
 
 	return nil
+}
+
+func (s *Server) handleScanMissingEmbs(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	be := s.embeddings.embedBackends[len(s.embeddings.embedBackends)-1]
+
+	if err := s.embeddings.processDeadLetterQueue(ctx, be); err != nil {
+		http.Error(w, err.Error(), 500)
+	}
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/indigo/api/bsky"
+	"github.com/bluesky-social/indigo/atproto/syntax"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -901,4 +902,120 @@ type embedInfoPortable struct {
 type addEmbeddingsBody struct {
 	ModelID    string
 	Embeddings map[string]embedInfoPortable
+}
+
+type missingEmbsResponse struct {
+	Posts []string
+	Users []string
+}
+
+func (s *embStore) processDeadLetterQueue(ctx context.Context, be embedBackendConfig) error {
+	req, err := http.NewRequest("GET", be.Host+"/missingEmbeddings", nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+
+	var body missingEmbsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return err
+	}
+
+	for _, p := range body.Posts {
+		if err := s.refreshPostEmbByUri(ctx, p); err != nil {
+			slog.Error("failed to refresh post emb", "uri", p, "error", err)
+		}
+	}
+
+	for _, u := range body.Users {
+		if err := s.refreshUserByDid(ctx, u); err != nil {
+			slog.Error("failed to refresh user emb", "did", u, "error", err)
+		}
+	}
+
+	return nil
+}
+
+func (s *embStore) refreshUserByDid(ctx context.Context, did string) error {
+	r, err := s.b.getOrCreateRepo(ctx, did)
+	if err != nil {
+		return err
+	}
+
+	if err := s.CreateOrUpdateUserEmbedding(ctx, r); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *embStore) refreshPostEmbByUri(ctx context.Context, uri string) error {
+	puri, err := syntax.ParseATURI(uri)
+	if err != nil {
+		return err
+	}
+
+	r, err := s.b.getOrCreateRepo(ctx, puri.Authority().String())
+	if err != nil {
+		return err
+	}
+
+	p, err := s.b.getPostByUri(ctx, uri, "*")
+	if err != nil {
+		return err
+	}
+
+	var fp bsky.FeedPost
+	if err := fp.UnmarshalCBOR(bytes.NewReader(p.Raw)); err != nil {
+		return fmt.Errorf("unmarshal failed: %w", err)
+	}
+
+	return s.refreshPostEmbedding(ctx, r, p, &fp)
+}
+
+func (s *embStore) refreshPostEmbedding(ctx context.Context, repo *Repo, p *Post, fp *bsky.FeedPost) error {
+	start := time.Now()
+	defer func() {
+		doEmbedHist.WithLabelValues("post").Observe(time.Since(start).Seconds())
+	}()
+
+	var existing postEmbedding
+	if err := s.db.Raw("SELECT * FROM post_embeddings WHERE post = ?", p.ID).Scan(&existing).Error; err != nil {
+		return err
+	}
+
+	if existing.ID != 0 {
+		// already have an embedding for this post, send it up
+		oemb := &Embedding{
+			Vector:  existing.Embedding.Slice(),
+			ModelID: existing.Model,
+		}
+
+		if err := s.pushRemotePostEmbedding(ctx, repo, p, oemb); err != nil {
+			slog.Error("failed to push refreshed post embedding", "error", err)
+		}
+		return nil
+	}
+
+	emb, err := s.computePostEmbedding(ctx, repo, p, fp)
+	if err != nil {
+		return fmt.Errorf("failed to compute emb: %w", err)
+	}
+
+	if err := s.db.Create(&postEmbedding{
+		Post:      p.ID,
+		Model:     emb.ModelID,
+		Embedding: pgvector.NewVector(emb.Vector),
+	}).Error; err != nil {
+		return err
+	}
+
+	if err := s.pushRemotePostEmbedding(ctx, repo, p, emb); err != nil {
+		slog.Error("failed to push post embedding", "error", err)
+	}
+
+	return nil
 }
