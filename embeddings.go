@@ -610,6 +610,10 @@ func (s *embStore) pushClusterUpdate(ctx context.Context, be embedBackendConfig,
 			slog.Warn("cluster update finished", "took", time.Since(start))
 		}
 	}()
+	if len(clmap) == 0 {
+		return nil
+	}
+
 	var clinfo clusterInfoWeights
 	var biggest int
 	var biggestVal float64
