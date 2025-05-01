@@ -184,10 +184,8 @@ func (s *embStore) CreatePostEmbedding(ctx context.Context, repo *Repo, p *Post,
 		return err
 	}
 
-	for _, be := range s.embedBackends {
-		if err := s.pushRemotePostEmbedding(ctx, be, repo, p, emb); err != nil {
-			slog.Error("failed to push post embedding", "error", err)
-		}
+	if err := s.pushRemotePostEmbedding(ctx, repo, p, emb); err != nil {
+		slog.Error("failed to push post embedding", "error", err)
 	}
 
 	return nil
@@ -424,7 +422,7 @@ func (s *embStore) CreateOrUpdateUserEmbedding(ctx context.Context, r *Repo) err
 	return nil
 }
 
-func (s *embStore) pushRemotePostEmbedding(ctx context.Context, be embedBackendConfig, r *Repo, p *Post, emb *Embedding) error {
+func (s *embStore) pushRemotePostEmbedding(ctx context.Context, r *Repo, p *Post, emb *Embedding) error {
 	url := "at://" + r.Did + "/app.bsky.feed.post/" + p.Rkey
 
 	s.bufEmbLk.Lock()
@@ -455,6 +453,16 @@ func (s *embStore) pushRemotePostEmbedding(ctx context.Context, be embedBackendC
 	s.bufferedPostEmbUpdates = nil
 	s.bufEmbLk.Unlock()
 
+	for _, be := range s.embedBackends {
+		if err := s.sendEmbeddingBatch(ctx, be, toSend); err != nil {
+			slog.Error("failed to push embedding batch", "backend", be.Host, "batchSize", len(toSend.Embeddings), "error", err)
+		}
+	}
+
+	return nil
+}
+
+func (s *embStore) sendEmbeddingBatch(ctx context.Context, be embedBackendConfig, toSend *addEmbeddingsBody) error {
 	b, err := json.Marshal(toSend)
 	if err != nil {
 		return err
