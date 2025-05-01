@@ -948,6 +948,7 @@ func (s *embStore) processDeadLetterQueue(ctx context.Context, be embedBackendCo
 		if err := s.refreshUserByDid(ctx, u); err != nil {
 			slog.Error("failed to refresh user emb", "did", u, "error", err)
 		}
+		slog.Info("user embedding refreshed", "uri", u)
 	}
 
 	return nil
