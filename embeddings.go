@@ -925,10 +925,12 @@ func (s *embStore) processDeadLetterQueue(ctx context.Context, be embedBackendCo
 		return err
 	}
 
+	slog.Warn("dead letter queue fetched")
 	for _, p := range body.Posts {
 		if err := s.refreshPostEmbByUri(ctx, p); err != nil {
 			slog.Error("failed to refresh post emb", "uri", p, "error", err)
 		}
+		slog.Info("post embedding refreshed", "uri", p)
 	}
 
 	for _, u := range body.Users {
@@ -966,6 +968,15 @@ func (s *embStore) refreshPostEmbByUri(ctx context.Context, uri string) error {
 	p, err := s.b.getPostByUri(ctx, uri, "*")
 	if err != nil {
 		return err
+	}
+
+	if p.NotFound || len(p.Raw) == 0 {
+		npb, err := s.s.refetchPostByUri(ctx, uri)
+		if err != nil {
+			return err
+		}
+
+		p.Raw = npb
 	}
 
 	var fp bsky.FeedPost

@@ -2688,6 +2688,65 @@ func (s *Server) refetchProfileForDid(ctx context.Context, did string) error {
 	return pgb.HandleUpdateProfile(ctx, r, "self", "", buf.Bytes(), cc)
 }
 
+func (s *Server) refetchPostByUri(ctx context.Context, uri string) ([]byte, error) {
+	pgb, ok := s.backend.(*PostgresBackend)
+	if !ok {
+		return nil, fmt.Errorf("only handling profile resets on postgres backend right now")
+	}
+
+	puri, err := syntax.ParseATURI(uri)
+	if err != nil {
+		return nil, err
+	}
+
+	did := puri.Authority().String()
+	if !strings.HasPrefix(did, "did:") {
+		return nil, fmt.Errorf("somehow got a handle in the uri")
+	}
+
+	r, err := pgb.getOrCreateRepo(ctx, did)
+	if err != nil {
+		return nil, err
+	}
+
+	ident, err := s.bf.Directory.LookupDID(ctx, syntax.DID(did))
+	if err != nil {
+		return nil, err
+	}
+
+	pdsHost := ident.PDSEndpoint()
+
+	xrpcc := &xrpc.Client{
+		Host: pdsHost,
+	}
+
+	resp, err := atproto.RepoGetRecord(ctx, xrpcc, "", "app.bsky.feed.post", did, puri.RecordKey().String())
+	if err != nil {
+		return nil, err
+	}
+
+	post, ok := resp.Value.Val.(*bsky.FeedPost)
+	if !ok {
+		return nil, fmt.Errorf("didnt get back a post")
+	}
+
+	buf := new(bytes.Buffer)
+	if err := post.MarshalCBOR(buf); err != nil {
+		return nil, err
+	}
+
+	var cc cid.Cid
+	if resp.Cid != nil {
+		oc, err := cid.Decode(*resp.Cid)
+		if err != nil {
+			return nil, err
+		}
+		cc = oc
+	}
+
+	return buf.Bytes(), pgb.HandleCreatePost(ctx, r, puri.RecordKey().String(), buf.Bytes(), cc)
+}
+
 func (s *Server) handleRescanRepo(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(r.URL.Path, "/")
 	did := parts[len(parts)-1]
