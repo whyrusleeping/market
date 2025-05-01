@@ -1007,7 +1007,7 @@ func (s *embStore) refreshPostEmbByUri(ctx context.Context, uri string) error {
 	if p.NotFound || len(p.Raw) == 0 {
 		npb, err := s.s.refetchPostByUri(ctx, uri)
 		if err != nil {
-			return err
+			return fmt.Errorf("refetch post record failed: %w", err)
 		}
 
 		p.Raw = npb

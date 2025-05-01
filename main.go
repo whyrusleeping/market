@@ -456,7 +456,6 @@ func main() {
 			http.HandleFunc("/check/repo/", s.handleCheckRepo)
 			http.HandleFunc("/check/missingembs", s.handleScanMissingEmbs)
 			http.ListenAndServe(":5151", nil)
-
 		}()
 
 		<-quit
@@ -2800,7 +2799,6 @@ func (s *Server) handleCheckRepo(w http.ResponseWriter, r *http.Request) {
 
 	if err := json.NewEncoder(w).Encode(missing); err != nil {
 		slog.Error("failed to write response", "error", err)
-
 	}
 }
 
