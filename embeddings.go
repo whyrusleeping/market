@@ -936,19 +936,35 @@ func (s *embStore) processDeadLetterQueue(ctx context.Context, be embedBackendCo
 		return err
 	}
 
+	limiter := make(chan struct{}, 8)
+
 	slog.Info("dead letter queue sizes", "posts", len(body.Posts), "users", len(body.Users))
 	for _, p := range body.Posts {
-		if err := s.refreshPostEmbByUri(ctx, p); err != nil {
-			slog.Error("failed to refresh post emb", "uri", p, "error", err)
-		}
-		slog.Info("post embedding refreshed", "uri", p)
+		limiter <- struct{}{}
+		go func(puri string) {
+			if err := s.refreshPostEmbByUri(ctx, puri); err != nil {
+				slog.Error("failed to refresh post emb", "uri", puri, "error", err)
+			} else {
+				slog.Info("post embedding refreshed", "uri", puri)
+			}
+			<-limiter
+		}(p)
 	}
 
 	for _, u := range body.Users {
-		if err := s.refreshUserByDid(ctx, u); err != nil {
-			slog.Error("failed to refresh user emb", "did", u, "error", err)
-		}
-		slog.Info("user embedding refreshed", "uri", u)
+		limiter <- struct{}{}
+		go func(did string) {
+			if err := s.refreshUserByDid(ctx, did); err != nil {
+				slog.Error("failed to refresh user emb", "did", did, "error", err)
+			} else {
+				slog.Info("user embedding refreshed", "uri", did)
+			}
+			<-limiter
+		}(u)
+	}
+
+	for i := 0; i < 8; i++ {
+		limiter <- struct{}{}
 	}
 
 	return nil
