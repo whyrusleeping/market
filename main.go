@@ -1090,7 +1090,7 @@ func (b *PostgresBackend) revForRepo(rr *Repo) (string, error) {
 	}
 
 	var rev string
-	if err := b.db.Raw("SELECT COALESCE(rev, '') FROM gorm_db_jobs WHERE repo = ?", rr.Did).Scan(&rev).Error; err != nil {
+	if err := b.pgx.QueryRow(context.TODO(), "SELECT COALESCE(rev, '') FROM gorm_db_jobs WHERE repo = $1", rr.Did).Scan(&rev); err != nil {
 		return "", err
 	}
 
@@ -1231,15 +1231,13 @@ func (b *PostgresBackend) Flush(ctx context.Context) error {
 }
 
 func (b *PostgresBackend) checkPostExists(ctx context.Context, repo *Repo, rkey string) (bool, error) {
-	var result struct {
-		ID       uint
-		NotFound bool
-	}
-	if err := b.db.Raw("select id, not_found from posts where author = ? and rkey = ?", repo.ID, rkey).Scan(&result).Error; err != nil {
+	var id uint
+	var notfound bool
+	if err := b.pgx.QueryRow(ctx, "SELECT id, not_found FROM posts WHERE author = $1 AND rkey = $2", repo.ID, rkey).Scan(&id, &notfound); err != nil {
 		return false, err
 	}
 
-	if result.ID != 0 && !result.NotFound {
+	if id != 0 && !notfound {
 		return true, nil
 	}
 
