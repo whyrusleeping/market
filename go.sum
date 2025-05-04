@@ -44,6 +44,8 @@ github.com/bitly/go-hostpool v0.0.0-20171023180738-a3a6125de932 h1:mXoPYz/Ul5HYE
 github.com/bitly/go-hostpool v0.0.0-20171023180738-a3a6125de932/go.mod h1:NOuUCSz6Q9T7+igc/hlvDOUdtWKryOrtFyIVABv/p7k=
 github.com/bluesky-social/indigo v0.0.0-20250502235128-8990acbb3944 h1:ZMUob1tephV0aBIRzZeNnTGMSR7R1/mJ3XiynUhjbWg=
 github.com/bluesky-social/indigo v0.0.0-20250502235128-8990acbb3944/go.mod h1:ovyxp8AMO1Hoe838vMJUbqHTZaAR8ABM3g3TXu+A5Ng=
+github.com/bluesky-social/indigo v0.0.0-20250504204239-61d379b66a53 h1:3QgQIDQkrN5wehvjuu60hrbMJFeAIQQgSD5D5GSme8M=
+github.com/bluesky-social/indigo v0.0.0-20250504204239-61d379b66a53/go.mod h1:ovyxp8AMO1Hoe838vMJUbqHTZaAR8ABM3g3TXu+A5Ng=
 github.com/bmizerany/assert v0.0.0-20160611221934-b7ed37b82869 h1:DDGfHa7BWjL4YnC6+E63dPcxHo2sUxDIu8g3QgEJdRY=
 github.com/bmizerany/assert v0.0.0-20160611221934-b7ed37b82869/go.mod h1:Ekp36dRnpXw/yCqJaO+ZrUyxD+3VXMFFr56k5XYrpB4=
 github.com/bradfitz/gomemcache v0.0.0-20230905024940-24af94b03874 h1:N7oVaKyGp8bttX0bfZGmcGkjz7DLQXhAn3DNd3T0ous=
