@@ -244,8 +244,10 @@ func (j *Pgxjob) BufferOps(ctx context.Context, since *string, rev string, ops [
 	defer j.lk.Unlock()
 
 	switch j.state {
-	case backfill.StateComplete, backfill.StateEnqueued:
+	case backfill.StateComplete:
 		return false, nil
+	case backfill.StateEnqueued:
+		return true, nil
 	case backfill.StateInProgress:
 		// keep going and buffer the op
 	default:
