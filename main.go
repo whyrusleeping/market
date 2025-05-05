@@ -1091,6 +1091,9 @@ func (b *PostgresBackend) revForRepo(rr *Repo) (string, error) {
 
 	var rev string
 	if err := b.pgx.QueryRow(context.TODO(), "SELECT COALESCE(rev, '') FROM gorm_db_jobs WHERE repo = $1", rr.Did).Scan(&rev); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
 		return "", err
 	}
 
@@ -1234,6 +1237,9 @@ func (b *PostgresBackend) checkPostExists(ctx context.Context, repo *Repo, rkey 
 	var id uint
 	var notfound bool
 	if err := b.pgx.QueryRow(ctx, "SELECT id, not_found FROM posts WHERE author = $1 AND rkey = $2", repo.ID, rkey).Scan(&id, &notfound); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
 		return false, err
 	}
 
