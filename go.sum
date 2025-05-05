@@ -50,6 +50,8 @@ github.com/bluesky-social/indigo v0.0.0-20250505032100-66d6ccd16611 h1:snyGiUJg3
 github.com/bluesky-social/indigo v0.0.0-20250505032100-66d6ccd16611/go.mod h1:ovyxp8AMO1Hoe838vMJUbqHTZaAR8ABM3g3TXu+A5Ng=
 github.com/bluesky-social/indigo v0.0.0-20250505032226-bbe13fc381ac h1:SJBM6u4xEfA303WxVMUnc7L+l2sxFgEBfwTPVcxy8AM=
 github.com/bluesky-social/indigo v0.0.0-20250505032226-bbe13fc381ac/go.mod h1:ovyxp8AMO1Hoe838vMJUbqHTZaAR8ABM3g3TXu+A5Ng=
+github.com/bluesky-social/indigo v0.0.0-20250505064817-1528f630b6d5 h1:XSr81J5niO9yioF4kNPJFkQGFOafj3OhgcvYOtace70=
+github.com/bluesky-social/indigo v0.0.0-20250505064817-1528f630b6d5/go.mod h1:ovyxp8AMO1Hoe838vMJUbqHTZaAR8ABM3g3TXu+A5Ng=
 github.com/bmizerany/assert v0.0.0-20160611221934-b7ed37b82869 h1:DDGfHa7BWjL4YnC6+E63dPcxHo2sUxDIu8g3QgEJdRY=
 github.com/bmizerany/assert v0.0.0-20160611221934-b7ed37b82869/go.mod h1:Ekp36dRnpXw/yCqJaO+ZrUyxD+3VXMFFr56k5XYrpB4=
 github.com/bradfitz/gomemcache v0.0.0-20230905024940-24af94b03874 h1:N7oVaKyGp8bttX0bfZGmcGkjz7DLQXhAn3DNd3T0ous=

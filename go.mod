@@ -6,7 +6,7 @@ toolchain go1.23.4
 
 require (
 	cloud.google.com/go/bigquery v1.66.2
-	github.com/bluesky-social/indigo v0.0.0-20250505032226-bbe13fc381ac
+	github.com/bluesky-social/indigo v0.0.0-20250505064817-1528f630b6d5
 	github.com/goccy/go-json v0.10.5
 	github.com/gorilla/websocket v1.5.1
 	github.com/hashicorp/golang-lru/v2 v2.0.7
