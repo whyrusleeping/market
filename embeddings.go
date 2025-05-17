@@ -232,19 +232,33 @@ func (s *embStore) computePostEmbedding(ctx context.Context, r *Repo, p *Post, f
 		}
 	}
 
-	if fp.Embed != nil && fp.Embed.EmbedImages != nil {
-		for _, img := range fp.Embed.EmbedImages.Images {
-			if img.Image != nil {
-				imgb, _, err := s.getImage(ctx, r.Did, img.Image.Ref.String(), "feed_fullsize")
-				if err != nil {
-					return nil, fmt.Errorf("getting image: %w", err)
-				}
+	if fp.Embed != nil {
+		if fp.Embed.EmbedImages != nil {
+			for _, img := range fp.Embed.EmbedImages.Images {
+				if img.Image != nil {
+					imgb, _, err := s.getImage(ctx, r.Did, img.Image.Ref.String(), "feed_fullsize")
+					if err != nil {
+						return nil, fmt.Errorf("getting image: %w", err)
+					}
 
-				peb.Images = append(peb.Images, &pictureObj{
-					Cid:   img.Image.Ref.String(),
-					Bytes: imgb,
-				})
+					peb.Images = append(peb.Images, &pictureObj{
+						Cid:   img.Image.Ref.String(),
+						Bytes: imgb,
+					})
+				}
 			}
+		}
+		if fp.Embed.EmbedVideo != nil {
+			vid := fp.Embed.EmbedVideo
+
+			imgb, err := s.getVideoThumbnail(ctx, r.Did, vid.Video.Ref.String())
+			if err != nil {
+				return nil, fmt.Errorf("getting video thumbnail: %w", err)
+			}
+			peb.Images = append(peb.Images, &pictureObj{
+				Cid:   vid.Video.Ref.String(),
+				Bytes: imgb,
+			})
 		}
 	}
 
@@ -286,6 +300,21 @@ func (s *embStore) computePostEmbedding(ctx context.Context, r *Repo, p *Post, f
 	}
 
 	return &out, nil
+}
+
+func (s *embStore) getVideoThumbnail(ctx context.Context, did, cid string) ([]byte, error) {
+	uri := fmt.Sprintf("https://video.bsky.app/watch/%s/%s/thumbnail.jpg", did, cid)
+
+	if err := s.s.maybeFetchImage(ctx, uri, s.s.imageCacheDir); err != nil {
+		return nil, err
+	}
+
+	buf := new(bytes.Buffer)
+	if err := s.s.getImageFromCache(ctx, did, cid, buf, true); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
 }
 
 func (s *embStore) getImage(ctx context.Context, did string, cid string, kind string) ([]byte, string, error) {
