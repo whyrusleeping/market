@@ -403,24 +403,15 @@ func (s *embStore) CreateOrUpdateUserEmbedding(ctx context.Context, r *Repo) err
 		return err
 	}
 
-	var wg sync.WaitGroup
-	for _, be := range s.embedBackends {
-		wg.Add(1)
-		go func(xbe embedBackendConfig) {
-			defer wg.Done()
-			if emb.Clusters != nil {
-				if err := s.pushClusterUpdate(ctx, xbe, emb.ModelID, r, emb.Clusters); err != nil {
-					slog.Error("failed to push cluster update", "did", r.Did, "error", err)
-				}
-			}
-
-			if err := s.pushRemoteUserEmbedding(ctx, be, r, emb); err != nil {
-				slog.Error("failed to push remote embedding", "did", r.Did, "error", err)
-			}
-		}(be)
+	if emb.Clusters != nil {
+		if err := s.pushClusterUpdate(ctx, emb.ModelID, r, emb.Clusters); err != nil {
+			slog.Error("failed to push cluster update", "did", r.Did, "error", err)
+		}
 	}
 
-	wg.Wait()
+	if err := s.pushRemoteUserEmbedding(ctx, r, emb); err != nil {
+		slog.Error("failed to push remote embedding", "did", r.Did, "error", err)
+	}
 
 	return nil
 }
@@ -493,7 +484,7 @@ func (s *embStore) sendEmbeddingBatch(ctx context.Context, be embedBackendConfig
 	return nil
 }
 
-func (s *embStore) pushRemoteUserEmbedding(ctx context.Context, be embedBackendConfig, r *Repo, emb *Embedding) error {
+func (s *embStore) pushRemoteUserEmbedding(ctx context.Context, r *Repo, emb *Embedding) error {
 	s.bufEmbLk.Lock()
 	if s.bufferedUserEmbUpdates == nil {
 		s.bufferedUserEmbUpdates = &addEmbeddingsBody{
@@ -520,6 +511,16 @@ func (s *embStore) pushRemoteUserEmbedding(ctx context.Context, be embedBackendC
 	s.bufferedUserEmbUpdates = nil
 	s.bufEmbLk.Unlock()
 
+	for _, be := range s.embedBackends {
+		if err := s.sendUserEmbeddings(ctx, be, toSend); err != nil {
+			slog.Error("failed to send embeddings to backend", "host", be.Host, "error", err)
+		}
+	}
+
+	return nil
+}
+
+func (s *embStore) sendUserEmbeddings(ctx context.Context, be embedBackendConfig, toSend *addEmbeddingsBody) error {
 	b, err := json.Marshal(toSend)
 	if err != nil {
 		return err
@@ -602,7 +603,7 @@ func (s *embStore) newClusterInfoSimilar(ctx context.Context, r *Repo, clinfo *c
 	return false, nil
 }
 
-func (s *embStore) pushClusterUpdate(ctx context.Context, be embedBackendConfig, model string, r *Repo, clmap map[int]float64) error {
+func (s *embStore) pushClusterUpdate(ctx context.Context, model string, r *Repo, clmap map[int]float64) error {
 	start := time.Now()
 	defer func() {
 		took := time.Since(start)
@@ -656,6 +657,17 @@ func (s *embStore) pushClusterUpdate(ctx context.Context, be embedBackendConfig,
 		Assignments: toSend,
 	}
 
+	for _, be := range s.embedBackends {
+		if err := s.sendClusterUpdates(ctx, be, body); err != nil {
+			slog.Error("failed to push cluster updates to backend", "backend", be.Host, "error", err)
+		}
+	}
+
+	return nil
+}
+
+func (s *embStore) sendClusterUpdates(ctx context.Context, be embedBackendConfig, body *updateClustersBody) error {
+
 	b, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -668,7 +680,6 @@ func (s *embStore) pushClusterUpdate(ctx context.Context, be embedBackendConfig,
 		}
 
 		req.Header.Add("Content-Type", "application/json")
-
 		req.Header.Set("Authorization", "Bearer "+be.Key)
 
 		resp, err := http.DefaultClient.Do(req)
@@ -915,28 +926,38 @@ type missingEmbsResponse struct {
 	Users []string
 }
 
-func (s *embStore) processDeadLetterQueue(ctx context.Context, be embedBackendConfig) error {
+type dlqStats struct {
+	PostsComputed int
+	PostsFailed   int
+	UsersComputed int
+	UsersFailed   int
+}
+
+func (s *embStore) processDeadLetterQueue(ctx context.Context, be embedBackendConfig) (*dlqStats, error) {
 	req, err := http.NewRequest("GET", s.vectoorHost+"/missingEmbeddings", nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("got non-200 status from backend for dead letter queue (%d): %s", resp.StatusCode, string(b))
+		return nil, fmt.Errorf("got non-200 status from backend for dead letter queue (%d): %s", resp.StatusCode, string(b))
 	}
 
 	var body missingEmbsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return err
+		return nil, err
 	}
 
 	limiter := make(chan struct{}, 8)
+
+	var flk sync.Mutex
+	var failPosts, failUsers []string
 
 	slog.Info("dead letter queue sizes", "posts", len(body.Posts), "users", len(body.Users))
 	for _, p := range body.Posts {
@@ -944,6 +965,9 @@ func (s *embStore) processDeadLetterQueue(ctx context.Context, be embedBackendCo
 		go func(puri string) {
 			if err := s.refreshPostEmbByUri(ctx, puri); err != nil {
 				slog.Error("failed to refresh post emb", "uri", puri, "error", err)
+				flk.Lock()
+				failPosts = append(failPosts, puri)
+				flk.Unlock()
 			} else {
 				slog.Info("post embedding refreshed", "uri", puri)
 			}
@@ -956,6 +980,9 @@ func (s *embStore) processDeadLetterQueue(ctx context.Context, be embedBackendCo
 		go func(did string) {
 			if err := s.refreshUserByDid(ctx, did); err != nil {
 				slog.Error("failed to refresh user emb", "did", did, "error", err)
+				flk.Lock()
+				failUsers = append(failUsers, did)
+				flk.Unlock()
 			} else {
 				slog.Info("user embedding refreshed", "uri", did)
 			}
@@ -966,6 +993,51 @@ func (s *embStore) processDeadLetterQueue(ctx context.Context, be embedBackendCo
 	for i := 0; i < 8; i++ {
 		limiter <- struct{}{}
 	}
+
+	if err := s.markEmbeddingsAsFailed(ctx, failPosts, failUsers); err != nil {
+		slog.Error("failed to mark embeddings as failed", "error", err)
+	}
+
+	return &dlqStats{
+		PostsComputed: len(body.Posts) - len(failPosts),
+		PostsFailed:   len(failPosts),
+		UsersComputed: len(body.Users) - len(failUsers),
+		UsersFailed:   len(failUsers),
+	}, nil
+}
+
+type missingEmbBody struct {
+	FailedPosts []string
+	FailedUsers []string
+}
+
+func (s *embStore) markEmbeddingsAsFailed(ctx context.Context, posts, users []string) error {
+	b, err := json.Marshal(missingEmbBody{
+		FailedPosts: posts,
+		FailedUsers: users,
+	})
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", s.vectoorHost+"/missingEmbeddings", bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Add("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("non-200 status code: %d", resp.StatusCode)
+	}
+
+	_, _ = io.Copy(io.Discard, resp.Body)
 
 	return nil
 }

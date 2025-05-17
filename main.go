@@ -804,7 +804,7 @@ func (b *PostgresBackend) aggregateCounts() (int, error) {
 		return 0, err
 	}
 
-	slog.Info("processing post count tasks", "count", len(tasks))
+	//slog.Info("processing post count tasks", "count", len(tasks))
 
 	batch := make(map[uint]*PostCounts)
 	for _, t := range tasks {
@@ -3010,8 +3010,11 @@ func (s *Server) handleScanMissingEmbs(w http.ResponseWriter, r *http.Request) {
 
 	be := s.embeddings.embedBackends[len(s.embeddings.embedBackends)-1]
 
-	if err := s.embeddings.processDeadLetterQueue(ctx, be); err != nil {
+	res, err := s.embeddings.processDeadLetterQueue(ctx, be)
+	if err != nil {
 		slog.Error("failed to process dead letter queue", "backend", be.Host, "error", err)
 		http.Error(w, err.Error(), 500)
 	}
+
+	json.NewEncoder(w).Encode(res)
 }
