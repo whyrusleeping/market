@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -305,16 +306,35 @@ func (s *embStore) computePostEmbedding(ctx context.Context, r *Repo, p *Post, f
 func (s *embStore) getVideoThumbnail(ctx context.Context, did, cid string) ([]byte, error) {
 	uri := fmt.Sprintf("https://video.bsky.app/watch/%s/%s/thumbnail.jpg", did, cid)
 
-	if err := s.s.maybeFetchImage(ctx, uri, s.s.imageCacheDir); err != nil {
+	req, err := http.NewRequest("GET", uri, nil)
+	if err != nil {
 		return nil, err
 	}
 
-	buf := new(bytes.Buffer)
-	if err := s.s.getImageFromCache(ctx, did, cid, buf, true); err != nil {
+	req = req.WithContext(ctx)
+
+	if rlbypass := os.Getenv("BSKY_RATELIMITBYPASS"); rlbypass != "" {
+		req.Header.Set("x-ratelimit-bypass", rlbypass)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch error: %w", err)
+	}
+
+	if resp.StatusCode != 200 {
+		if resp.StatusCode == 404 {
+			return nil, fmt.Errorf("thumbnail not found")
+		}
+		return nil, fmt.Errorf("invalid status: %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
 		return nil, err
 	}
 
-	return buf.Bytes(), nil
+	return data, nil
 }
 
 func (s *embStore) getImage(ctx context.Context, did string, cid string, kind string) ([]byte, string, error) {
