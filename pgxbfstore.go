@@ -246,7 +246,9 @@ func (j *Pgxjob) BufferOps(ctx context.Context, since *string, rev string, ops [
 	switch j.state {
 	case backfill.StateComplete:
 		return false, nil
-	case backfill.StateInProgress, backfill.StateEnqueued:
+	case backfill.StateEnqueued:
+		return true, nil
+	case backfill.StateInProgress:
 		// keep going and buffer the op
 	default:
 		if strings.HasPrefix(j.state, "failed") {

@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -94,7 +95,7 @@ func main() {
 		},
 		&cli.IntFlag{
 			Name:  "max-db-connections",
-			Value: 50,
+			Value: runtime.NumCPU(),
 		},
 		&cli.IntFlag{
 			Name:  "backfill-workers",
@@ -182,7 +183,14 @@ func main() {
 		var bfstore backfill.Store
 		if useBigQuery {
 			if db.Dialector.Name() == "postgres" {
-				pool, err := pgxpool.New(context.TODO(), cctx.String("db-url"))
+				cfg, err := pgxpool.ParseConfig(cctx.String("db-url"))
+				if err != nil {
+					return err
+				}
+
+				cfg.MaxConns = int32(cctx.Int("max-db-connections"))
+
+				pool, err := pgxpool.NewWithConfig(context.TODO(), cfg)
 				if err != nil {
 					return err
 				}
@@ -958,21 +966,12 @@ func (b *PostgresBackend) postInfoForUri(ctx context.Context, uri string) (cache
 }
 
 func (b *PostgresBackend) tryLoadPostInfo(ctx context.Context, uid uint, rkey string) (*Post, error) {
-	q := "SELECT id, author FROM posts WHERE author = $1 AND rkey = $2"
-	rows, err := b.pgx.Query(ctx, q, uid, rkey)
-	if err != nil {
-		return nil, err
-	}
-
-	defer rows.Close()
-
-	// no such post found
-	if !rows.Next() {
-		return nil, nil
-	}
-
 	var p Post
-	if err := rows.Scan(&p.ID, &p.Author); err != nil {
+	q := "SELECT id, author FROM posts WHERE author = $1 AND rkey = $2"
+	if err := b.pgx.QueryRow(ctx, q, uid, rkey).Scan(&p.ID, &p.Author); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
 		return nil, err
 	}
 
@@ -1090,7 +1089,10 @@ func (b *PostgresBackend) revForRepo(rr *Repo) (string, error) {
 	}
 
 	var rev string
-	if err := b.db.Raw("SELECT COALESCE(rev, '') FROM gorm_db_jobs WHERE repo = ?", rr.Did).Scan(&rev).Error; err != nil {
+	if err := b.pgx.QueryRow(context.TODO(), "SELECT COALESCE(rev, '') FROM gorm_db_jobs WHERE repo = $1", rr.Did).Scan(&rev); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
 		return "", err
 	}
 
@@ -1231,15 +1233,16 @@ func (b *PostgresBackend) Flush(ctx context.Context) error {
 }
 
 func (b *PostgresBackend) checkPostExists(ctx context.Context, repo *Repo, rkey string) (bool, error) {
-	var result struct {
-		ID       uint
-		NotFound bool
-	}
-	if err := b.db.Raw("select id, not_found from posts where author = ? and rkey = ?", repo.ID, rkey).Scan(&result).Error; err != nil {
+	var id uint
+	var notfound bool
+	if err := b.pgx.QueryRow(ctx, "SELECT id, not_found FROM posts WHERE author = $1 AND rkey = $2", repo.ID, rkey).Scan(&id, &notfound); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
 		return false, err
 	}
 
-	if result.ID != 0 && !result.NotFound {
+	if id != 0 && !notfound {
 		return true, nil
 	}
 
