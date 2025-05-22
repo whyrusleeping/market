@@ -444,7 +444,10 @@ func main() {
 
 			time.Sleep(time.Millisecond * 100)
 
-			bf.Stop(context.TODO())
+			endctx, cancel := context.WithTimeout(ctx, time.Minute)
+			defer cancel()
+
+			bf.Stop(endctx)
 
 			if err := s.FlushCursor(); err != nil {
 				slog.Error("final flush cursor failed", "err", err)
