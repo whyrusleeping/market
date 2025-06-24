@@ -5,6 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/gif"
+	"image/jpeg"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"log/slog"
 	"math/rand/v2"
@@ -19,6 +24,7 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/nfnt/resize"
 	pgvector "github.com/pgvector/pgvector-go"
 	"github.com/whyrusleeping/market/halfvec"
 	. "github.com/whyrusleeping/market/models"
@@ -27,11 +33,11 @@ import (
 )
 
 type embStore struct {
-	db              *gorm.DB
-	pgxdb           *pgxpool.Pool
-	embeddingServer string
-	s               *Server
-	b               *PostgresBackend
+	db               *gorm.DB
+	pgxdb            *pgxpool.Pool
+	embeddingServers []embedServerConfig
+	s                *Server
+	b                *PostgresBackend
 
 	profileImageCache *lru.TwoQueueCache[string, []byte]
 
@@ -56,14 +62,27 @@ type embedBackendConfig struct {
 	Key  string
 }
 
-func NewEmbStore(db *gorm.DB, pgxdb *pgxpool.Pool, embserv string, s *Server, b *PostgresBackend) *embStore {
+type embedServerConfig struct {
+	Host  string
+	Model string
+}
+
+func NewEmbStore(db *gorm.DB, pgxdb *pgxpool.Pool, embservs []string, s *Server, b *PostgresBackend) *embStore {
+	var es []embedServerConfig
+	for _, h := range embservs {
+		parts := strings.Split(h, "|")
+		es = append(es, embedServerConfig{
+			Host:  parts[0],
+			Model: parts[1],
+		})
+	}
 	c, _ := lru.New2Q[string, []byte](100_000)
 	cmc, _ := lru.New[uint, *cachedClusterInfo](300_000)
 	puc, _ := lru.New2Q[uint, string](500_000)
 	return &embStore{
 		db:                     db,
 		pgxdb:                  pgxdb,
-		embeddingServer:        embserv,
+		embeddingServers:       es,
 		s:                      s,
 		b:                      b,
 		profileImageCache:      c,
@@ -113,6 +132,27 @@ type Embedding struct {
 	ModelID  string          `json:"model_id"`
 	Clusters map[int]float64 `json:"clusters,omitempty"`
 	Topic    *string         `json:"topic,omitempty"`
+}
+
+func (e *Embedding) PadVectorTo(n int) {
+	if len(e.Vector) < n {
+		e.Vector = append(e.Vector, make([]float32, n-len(e.Vector))...)
+	}
+}
+
+var embeddingSizes = map[string]int{
+	"blip2": 256,
+}
+
+func (e *Embedding) TrimPadding() {
+	es, ok := embeddingSizes[e.ModelID]
+	if !ok {
+		return
+	}
+
+	if len(e.Vector) > es {
+		e.Vector = e.Vector[:es]
+	}
 }
 
 type userEmbedding struct {
@@ -171,11 +211,27 @@ func (s *embStore) loadPostEmbedding(ctx context.Context, postUri string) (*Embe
 }
 
 func (s *embStore) CreatePostEmbedding(ctx context.Context, repo *Repo, p *Post, fp *bsky.FeedPost) error {
+	var wg sync.WaitGroup
+	for _, h := range s.embeddingServers {
+		wg.Add(1)
+		go func(hh string) {
+			defer wg.Done()
+			if err := s.createPostEmbedding(ctx, hh, repo, p, fp); err != nil {
+				slog.Error("failed to create post embedding", "host", hh, "error", err)
+			}
+		}(h.Host)
+	}
+
+	wg.Wait()
+	return nil
+}
+
+func (s *embStore) createPostEmbedding(ctx context.Context, host string, repo *Repo, p *Post, fp *bsky.FeedPost) error {
 	start := time.Now()
 	defer func() {
 		doEmbedHist.WithLabelValues("post").Observe(time.Since(start).Seconds())
 	}()
-	emb, err := s.computePostEmbedding(ctx, repo, p, fp)
+	emb, err := s.computePostEmbedding(ctx, host, repo, p, fp)
 	if err != nil {
 		return fmt.Errorf("failed to compute emb: %w", err)
 	}
@@ -195,7 +251,7 @@ func (s *embStore) CreatePostEmbedding(ctx context.Context, repo *Repo, p *Post,
 	return nil
 }
 
-func (s *embStore) computePostEmbedding(ctx context.Context, r *Repo, p *Post, fp *bsky.FeedPost) (*Embedding, error) {
+func (s *embStore) computePostEmbedding(ctx context.Context, host string, r *Repo, p *Post, fp *bsky.FeedPost) (*Embedding, error) {
 	var postPrep time.Time
 	start := time.Now()
 
@@ -203,8 +259,8 @@ func (s *embStore) computePostEmbedding(ctx context.Context, r *Repo, p *Post, f
 		took := time.Since(start)
 		prepTook := postPrep.Sub(start)
 
-		embeddingTimeHist.WithLabelValues("post", "total").Observe(took.Seconds())
-		embeddingTimeHist.WithLabelValues("post", "prep").Observe(prepTook.Seconds())
+		embeddingTimeHist.WithLabelValues("post", "total", host).Observe(took.Seconds())
+		embeddingTimeHist.WithLabelValues("post", "prep", host).Observe(prepTook.Seconds())
 	}()
 
 	authorEmb, err := s.loadUserEmbedding(ctx, r.ID)
@@ -273,7 +329,7 @@ func (s *embStore) computePostEmbedding(ctx context.Context, r *Repo, p *Post, f
 	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "POST", s.embeddingServer+"/embed/post", bytes.NewReader(b))
+	req, err := http.NewRequestWithContext(ctx, "POST", host+"/embed/post", bytes.NewReader(b))
 	if err != nil {
 		return nil, err
 	}
@@ -300,10 +356,29 @@ func (s *embStore) computePostEmbedding(ctx context.Context, r *Repo, p *Post, f
 		return nil, err
 	}
 
+	out.PadVectorTo(512)
+
 	return &out, nil
 }
 
 func (s *embStore) getVideoThumbnail(ctx context.Context, did, cid string) ([]byte, error) {
+	var lastError error
+	for i := 0; i < 3; i++ {
+		b, err := s.getVideoThumbnailDirect(ctx, did, cid)
+		if err == nil {
+			return b, nil
+		}
+
+		slog.Warn("failed to get video thumnail", "attempt", i, "did", did, "cid", cid, "error", err)
+		lastError = err
+
+		time.Sleep(time.Second * time.Duration(i+1))
+	}
+
+	return nil, lastError
+}
+
+func (s *embStore) getVideoThumbnailDirect(ctx context.Context, did, cid string) ([]byte, error) {
 	uri := fmt.Sprintf("https://video.bsky.app/watch/%s/%s/thumbnail.jpg", did, cid)
 
 	req, err := http.NewRequest("GET", uri, nil)
@@ -329,12 +404,19 @@ func (s *embStore) getVideoThumbnail(ctx context.Context, did, cid string) ([]by
 		return nil, fmt.Errorf("invalid status: %d", resp.StatusCode)
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	img, _, err := image.Decode(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 
-	return data, nil
+	rimg := resize.Resize(224, 224, img, resize.Lanczos2)
+
+	buf := new(bytes.Buffer)
+	if err := jpeg.Encode(buf, rimg, nil); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
 }
 
 func (s *embStore) getImage(ctx context.Context, did string, cid string, kind string) ([]byte, string, error) {
@@ -367,6 +449,15 @@ func (s *embStore) getImage(ctx context.Context, did string, cid string, kind st
 }
 
 func (s *embStore) CreateOrUpdateUserEmbedding(ctx context.Context, r *Repo) error {
+	for _, h := range s.embeddingServers {
+		if err := s.createOrUpdateUserEmbedding(ctx, h.Host, h.Model, r); err != nil {
+			slog.Error("failed to update user embedding", "host", h, "error", err)
+		}
+	}
+	return nil
+}
+
+func (s *embStore) createOrUpdateUserEmbedding(ctx context.Context, host, model string, r *Repo) error {
 	start := time.Now()
 	var postPrep time.Time
 	defer func() {
@@ -375,8 +466,8 @@ func (s *embStore) CreateOrUpdateUserEmbedding(ctx context.Context, r *Repo) err
 		took := time.Since(start)
 		prepTook := postPrep.Sub(start)
 
-		embeddingTimeHist.WithLabelValues("user", "total").Observe(took.Seconds())
-		embeddingTimeHist.WithLabelValues("user", "prep").Observe(prepTook.Seconds())
+		embeddingTimeHist.WithLabelValues("user", "total", host).Observe(took.Seconds())
+		embeddingTimeHist.WithLabelValues("user", "prep", host).Observe(prepTook.Seconds())
 	}()
 
 	var prof Profile
@@ -405,6 +496,13 @@ func (s *embStore) CreateOrUpdateUserEmbedding(ctx context.Context, r *Repo) err
 		imgb, _, err := s.getImage(ctx, r.Did, bp.Avatar.Ref.String(), "avatar")
 		if err != nil {
 			slog.Error("fetching avatar image failed", "did", r.Did, "cid", bp.Avatar.Ref.String(), "error", err)
+			if strings.Contains(err.Error(), "non-200 response code: 404") {
+				//TODO
+				if err := s.s.refetchProfileForDid(ctx, r.Did); err != nil {
+					slog.Error("got a 404 on avater fetch, then failed to refetch profile", "did", r.Did, "error", err)
+				}
+
+			}
 		} else {
 			pfpBytes = &pictureObj{
 				Cid:   bp.Avatar.Ref.String(),
@@ -425,7 +523,7 @@ func (s *embStore) CreateOrUpdateUserEmbedding(ctx context.Context, r *Repo) err
 		}
 	}
 
-	recentInteractions, uris, err := s.getRecentUserInteractions(ctx, r)
+	recentInteractions, uris, err := s.getRecentUserInteractions(ctx, r, model)
 	if err != nil {
 		return fmt.Errorf("get recent user interactions: %w", err)
 	}
@@ -434,7 +532,7 @@ func (s *embStore) CreateOrUpdateUserEmbedding(ctx context.Context, r *Repo) err
 
 	postPrep = time.Now()
 
-	emb, err := s.computeUserEmbedding(ctx, "", pfpBytes, headerBytes, description, name, interactions, uris)
+	emb, err := s.computeUserEmbedding(ctx, host, r.Did, pfpBytes, headerBytes, description, name, interactions, uris)
 	if err != nil {
 		return fmt.Errorf("computing embedding: %w", err)
 	}
@@ -570,12 +668,15 @@ func (s *embStore) pushRemoteUserEmbedding(ctx context.Context, r *Repo, emb *Em
 }
 
 func (s *embStore) sendUserEmbeddings(ctx context.Context, be embedBackendConfig, toSend *addEmbeddingsBody) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Second*5)
+	defer cancel()
+
 	b, err := json.Marshal(toSend)
 	if err != nil {
 		return err
 	}
 
-	req, err := http.NewRequest("POST", be.Host+"/admin/addUserEmbeddings", bytes.NewReader(b))
+	req, err := http.NewRequestWithContext(ctx, "POST", be.Host+"/admin/addUserEmbeddings", bytes.NewReader(b))
 	if err != nil {
 		return err
 	}
@@ -656,7 +757,7 @@ func (s *embStore) pushClusterUpdate(ctx context.Context, model string, r *Repo,
 	start := time.Now()
 	defer func() {
 		took := time.Since(start)
-		if took > time.Millisecond*150 {
+		if took > time.Millisecond*300 {
 			slog.Warn("cluster update finished", "took", time.Since(start))
 		}
 	}()
@@ -791,7 +892,7 @@ func (s *embStore) uriForPostID(ctx context.Context, pid uint) (string, error) {
 	return uri, nil
 }
 
-func (s *embStore) getRecentUserInteractions(ctx context.Context, r *Repo) ([]Embedding, []string, error) {
+func (s *embStore) getRecentUserInteractions(ctx context.Context, r *Repo, model string) ([]Embedding, []string, error) {
 	/*
 		rows, err := s.pgxdb.Query(ctx, "SELECT embedding, model FROM post_embeddings WHERE post IN (SELECT id FROM posts WHERE author = ? ORDER BY posts.rkey DESC limit 15)", r.ID)
 		if err != nil {
@@ -804,7 +905,7 @@ func (s *embStore) getRecentUserInteractions(ctx context.Context, r *Repo) ([]Em
 		}
 	*/
 	var posts []postEmbedding
-	if err := s.db.Raw("SELECT * FROM post_embeddings WHERE post IN (SELECT id FROM posts WHERE author = ? ORDER BY posts.rkey DESC limit 15)", r.ID).Scan(&posts).Error; err != nil {
+	if err := s.db.Raw("SELECT * FROM post_embeddings WHERE model = ? AND post IN (SELECT id FROM posts WHERE author = ? ORDER BY posts.rkey DESC limit 15)", model, r.ID).Scan(&posts).Error; err != nil {
 		return nil, nil, err
 	}
 
@@ -821,7 +922,7 @@ func (s *embStore) getRecentUserInteractions(ctx context.Context, r *Repo) ([]Em
 		}
 	*/
 	var likedPosts []postEmbedding
-	if err := s.db.Raw("SELECT * FROM post_embeddings WHERE post IN (SELECT subject FROM likes WHERE likes.author = ? ORDER BY likes.rkey DESC limit 15)", r.ID).Scan(&likedPosts).Error; err != nil {
+	if err := s.db.Raw("SELECT * FROM post_embeddings WHERE model = ? AND post IN (SELECT subject FROM likes WHERE likes.author = ? ORDER BY likes.rkey DESC limit 15)", model, r.ID).Scan(&likedPosts).Error; err != nil {
 		return nil, nil, err
 	}
 
@@ -841,10 +942,12 @@ func (s *embStore) getRecentUserInteractions(ctx context.Context, r *Repo) ([]Em
 			return nil, nil, err
 		}
 		uris = append(uris, puri)
-		out = append(out, Embedding{
+		e := Embedding{
 			Vector:  emb.Embedding.Slice(),
 			ModelID: emb.Model,
-		})
+		}
+		e.TrimPadding()
+		out = append(out, e)
 	}
 
 	for _, emb := range likedPosts {
@@ -853,10 +956,12 @@ func (s *embStore) getRecentUserInteractions(ctx context.Context, r *Repo) ([]Em
 			return nil, nil, err
 		}
 		uris = append(uris, puri)
-		out = append(out, Embedding{
+		e := Embedding{
 			Vector:  emb.Embedding.Slice(),
 			ModelID: emb.Model,
-		})
+		}
+		e.TrimPadding()
+		out = append(out, e)
 	}
 
 	return out, uris, nil
@@ -912,7 +1017,7 @@ type userEmbedBody struct {
 	Did                string      `json:"did"`
 }
 
-func (s *embStore) computeUserEmbedding(ctx context.Context, repo string, pfp, header *pictureObj, description, name string, interactions *Embedding, interuri []string) (*Embedding, error) {
+func (s *embStore) computeUserEmbedding(ctx context.Context, embhost, repo string, pfp, header *pictureObj, description, name string, interactions *Embedding, interuri []string) (*Embedding, error) {
 	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
 	defer cancel()
 
@@ -930,7 +1035,7 @@ func (s *embStore) computeUserEmbedding(ctx context.Context, repo string, pfp, h
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", s.embeddingServer+"/embed/user", bytes.NewReader(b))
+	req, err := http.NewRequestWithContext(ctx, "POST", embhost+"/embed/user", bytes.NewReader(b))
 	if err != nil {
 		return nil, err
 	}
@@ -956,6 +1061,8 @@ func (s *embStore) computeUserEmbedding(ctx context.Context, repo string, pfp, h
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
 	}
+
+	out.PadVectorTo(512)
 
 	return &out, nil
 }
@@ -1018,7 +1125,7 @@ func (s *embStore) processDeadLetterQueue(ctx context.Context, be embedBackendCo
 				failPosts = append(failPosts, puri)
 				flk.Unlock()
 			} else {
-				slog.Info("post embedding refreshed", "uri", puri)
+				//slog.Info("post embedding refreshed", "uri", puri)
 			}
 			<-limiter
 		}(p)
@@ -1033,7 +1140,7 @@ func (s *embStore) processDeadLetterQueue(ctx context.Context, be embedBackendCo
 				failUsers = append(failUsers, did)
 				flk.Unlock()
 			} else {
-				slog.Info("user embedding refreshed", "uri", did)
+				//slog.Info("user embedding refreshed", "uri", did)
 			}
 			<-limiter
 		}(u)
@@ -1107,6 +1214,16 @@ func (s *embStore) refreshUserByDid(ctx context.Context, did string) error {
 }
 
 func (s *embStore) refreshPostEmbByUri(ctx context.Context, uri string) error {
+	var outErr error
+	for _, h := range s.embeddingServers {
+		if err := s.refreshPostEmbByUriOnHost(ctx, h.Host, uri); err != nil {
+			outErr = fmt.Errorf("refresh failed on host: %q: %w", h, err)
+		}
+	}
+	return outErr
+}
+
+func (s *embStore) refreshPostEmbByUriOnHost(ctx context.Context, host, uri string) error {
 	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
 	defer cancel()
 
@@ -1139,10 +1256,10 @@ func (s *embStore) refreshPostEmbByUri(ctx context.Context, uri string) error {
 		return fmt.Errorf("unmarshal failed: %w", err)
 	}
 
-	return s.refreshPostEmbedding(ctx, r, p, &fp)
+	return s.refreshPostEmbedding(ctx, host, r, p, &fp)
 }
 
-func (s *embStore) refreshPostEmbedding(ctx context.Context, repo *Repo, p *Post, fp *bsky.FeedPost) error {
+func (s *embStore) refreshPostEmbedding(ctx context.Context, host string, repo *Repo, p *Post, fp *bsky.FeedPost) error {
 	start := time.Now()
 	defer func() {
 		doEmbedHist.WithLabelValues("post").Observe(time.Since(start).Seconds())
@@ -1166,17 +1283,25 @@ func (s *embStore) refreshPostEmbedding(ctx context.Context, repo *Repo, p *Post
 		return nil
 	}
 
-	emb, err := s.computePostEmbedding(ctx, repo, p, fp)
+	emb, err := s.computePostEmbedding(ctx, host, repo, p, fp)
 	if err != nil {
 		return fmt.Errorf("failed to compute emb: %w", err)
 	}
 
-	if err := s.db.Create(&postEmbedding{
+	res := s.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "post"}, {Name: "model"}},
+		DoNothing: true,
+	}).Create(&postEmbedding{
 		Post:      p.ID,
 		Model:     emb.ModelID,
 		Embedding: pgvector.NewVector(emb.Vector),
-	}).Error; err != nil {
+	})
+	if err := res.Error; err != nil {
 		return err
+	}
+
+	if res.RowsAffected == 0 {
+		return nil
 	}
 
 	if err := s.pushRemotePostEmbedding(ctx, repo, p, emb); err != nil {

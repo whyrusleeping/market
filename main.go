@@ -74,7 +74,7 @@ var embeddingTimeHist = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Name:    "embed_timing",
 	Help:    "A histogram of embedding computation time",
 	Buckets: prometheus.ExponentialBucketsRange(0.001, 30, 20),
-}, []string{"model", "phase"})
+}, []string{"model", "phase", "host"})
 
 var firehoseCursorGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "firehose_cursor",
@@ -116,7 +116,7 @@ func main() {
 		&cli.StringFlag{
 			Name: "bigquery-dataset",
 		},
-		&cli.StringFlag{
+		&cli.StringSliceFlag{
 			Name: "embedding-server",
 		},
 		&cli.StringFlag{
@@ -326,7 +326,8 @@ func main() {
 
 		ctx := context.TODO()
 
-		if embserv := cctx.String("embedding-server"); embserv != "" {
+		if embservs := cctx.StringSlice("embedding-server"); len(embservs) > 0 {
+
 			pgb, ok := s.backend.(*PostgresBackend)
 			if !ok {
 				return fmt.Errorf("can only use embedding service with postgres backend")
@@ -352,8 +353,10 @@ func main() {
 				return err
 			}
 
-			es := NewEmbStore(pgb.db, pgxpool, embserv, s, pgb)
+			es := NewEmbStore(pgb.db, pgxpool, embservs, s, pgb)
 			s.embeddings = es
+
+			es.vectoorHost = cctx.String("vectoor-host")
 
 			lpuc, _ := lru.New[uint, time.Time](500_000)
 			s.lastProfileUpdate = lpuc
@@ -368,7 +371,6 @@ func main() {
 				}
 			}
 
-			es.vectoorHost = cctx.String("vectoor-host")
 		}
 
 		curs, err := s.LoadCursor(ctx)
@@ -2453,7 +2455,7 @@ func (s *Server) maybeFetchImage(ctx context.Context, uri string, dir string) er
 			if resp.StatusCode == 404 {
 				return lastError
 			}
-			slog.Error("image fetch failed", "attempt", i, "error", lastError, "uri", uri)
+			slog.Warn("image fetch failed", "attempt", i, "error", lastError, "uri", uri)
 			time.Sleep(time.Second * time.Duration(i+1))
 			continue
 		}
