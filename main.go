@@ -2450,6 +2450,11 @@ func (s *Server) maybeFetchImage(ctx context.Context, uri string, dir string) er
 			return fmt.Errorf("fetch error: %w", err)
 		}
 
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+
 		if resp.StatusCode != 200 {
 			lastError = fmt.Errorf("non-200 response code: %d", resp.StatusCode)
 			if resp.StatusCode == 404 {
@@ -2458,11 +2463,6 @@ func (s *Server) maybeFetchImage(ctx context.Context, uri string, dir string) er
 			slog.Warn("image fetch failed", "attempt", i, "error", lastError, "uri", uri)
 			time.Sleep(time.Second * time.Duration(i+1))
 			continue
-		}
-
-		data, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return err
 		}
 
 		if err := s.putImageToCache(cidpart, data); err != nil {

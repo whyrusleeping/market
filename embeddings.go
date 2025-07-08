@@ -341,11 +341,12 @@ func (s *embStore) computePostEmbedding(ctx context.Context, host string, r *Rep
 		return nil, fmt.Errorf("embedding server errored: %w", err)
 	}
 
+	ob, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
 	if resp.StatusCode != 200 {
-		ob, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, err
-		}
 		fmt.Println("error on posts: ", string(ob))
 		return nil, fmt.Errorf("bad response status from embedding server: %d", resp.StatusCode)
 	}
@@ -623,8 +624,8 @@ func (s *embStore) sendEmbeddingBatch(ctx context.Context, be embedBackendConfig
 	}
 	defer resp.Body.Close()
 
+	bb, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		bb, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("non-200 status code from post embedding updates: %d - %s", resp.StatusCode, string(bb))
 	}
 
@@ -690,8 +691,8 @@ func (s *embStore) sendUserEmbeddings(ctx context.Context, be embedBackendConfig
 	}
 	defer resp.Body.Close()
 
+	bb, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		bb, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("non-200 status code from embedding updates: %d - %s", resp.StatusCode, string(bb))
 	}
 
@@ -843,8 +844,8 @@ func (s *embStore) sendClusterUpdates(ctx context.Context, be embedBackendConfig
 		}
 		defer resp.Body.Close()
 
+		bb, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode != 200 {
-			bb, _ := io.ReadAll(resp.Body)
 			return fmt.Errorf("non-200 status code from cluster update: %d - %s", resp.StatusCode, string(bb))
 		}
 
@@ -1047,11 +1048,12 @@ func (s *embStore) computeUserEmbedding(ctx context.Context, embhost, repo strin
 		return nil, err
 	}
 
+	ob, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
 	if resp.StatusCode != 200 {
-		ob, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, err
-		}
 		fmt.Println("error on user: ", string(ob))
 		return nil, fmt.Errorf("bad response status from embedding server: %d", resp.StatusCode)
 	}
@@ -1100,8 +1102,8 @@ func (s *embStore) processDeadLetterQueue(ctx context.Context, be embedBackendCo
 		return nil, err
 	}
 
+	b, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("got non-200 status from backend for dead letter queue (%d): %s", resp.StatusCode, string(b))
 	}
 
