@@ -1048,12 +1048,12 @@ func (s *embStore) computeUserEmbedding(ctx context.Context, embhost, repo strin
 		return nil, err
 	}
 
-	ob, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
 	if resp.StatusCode != 200 {
+		ob, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+
 		fmt.Println("error on user: ", string(ob))
 		return nil, fmt.Errorf("bad response status from embedding server: %d", resp.StatusCode)
 	}
