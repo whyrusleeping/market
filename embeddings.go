@@ -341,12 +341,12 @@ func (s *embStore) computePostEmbedding(ctx context.Context, host string, r *Rep
 		return nil, fmt.Errorf("embedding server errored: %w", err)
 	}
 
-	ob, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
 	if resp.StatusCode != 200 {
+		ob, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+
 		fmt.Println("error on posts: ", string(ob))
 		return nil, fmt.Errorf("bad response status from embedding server: %d", resp.StatusCode)
 	}
