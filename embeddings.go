@@ -1102,8 +1102,8 @@ func (s *embStore) processDeadLetterQueue(ctx context.Context, be embedBackendCo
 		return nil, err
 	}
 
-	b, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("got non-200 status from backend for dead letter queue (%d): %s", resp.StatusCode, string(b))
 	}
 
