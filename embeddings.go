@@ -293,7 +293,9 @@ func (s *embStore) computePostEmbedding(ctx context.Context, host string, r *Rep
 		if fp.Embed.EmbedImages != nil {
 			for _, img := range fp.Embed.EmbedImages.Images {
 				if img.Image != nil {
+					ifstart := time.Now()
 					imgb, _, err := s.getImage(ctx, r.Did, img.Image.Ref.String(), "feed_fullsize")
+					embeddingTimeHist.WithLabelValues("post", "image", host).Observe(time.Since(ifstart).Seconds())
 					if err != nil {
 						return nil, fmt.Errorf("getting image: %w", err)
 					}
@@ -308,7 +310,9 @@ func (s *embStore) computePostEmbedding(ctx context.Context, host string, r *Rep
 		if fp.Embed.EmbedVideo != nil {
 			vid := fp.Embed.EmbedVideo
 
+			ifstart := time.Now()
 			imgb, err := s.getVideoThumbnail(ctx, r.Did, vid.Video.Ref.String())
+			embeddingTimeHist.WithLabelValues("post", "vid_thumb", host).Observe(time.Since(ifstart).Seconds())
 			if err != nil {
 				return nil, fmt.Errorf("getting video thumbnail: %w", err)
 			}
