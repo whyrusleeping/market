@@ -76,6 +76,12 @@ var embeddingTimeHist = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Buckets: prometheus.ExponentialBucketsRange(0.001, 30, 20),
 }, []string{"model", "phase", "host"})
 
+var refreshEmbeddingHist = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "refresh_embed_timing",
+	Help:    "A histogram of embedding refresh times",
+	Buckets: prometheus.ExponentialBucketsRange(0.001, 30, 20),
+}, []string{"host"})
+
 var firehoseCursorGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "firehose_cursor",
 }, []string{"stage"})

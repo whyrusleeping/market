@@ -1089,9 +1089,12 @@ type dlqStats struct {
 	PostsFailed   int
 	UsersComputed int
 	UsersFailed   int
+	ElapsedSecs   float64
 }
 
 func (s *embStore) processDeadLetterQueue(ctx context.Context, be embedBackendConfig) (*dlqStats, error) {
+	start := time.Now()
+
 	req, err := http.NewRequest("GET", s.vectoorHost+"/missingEmbeddings", nil)
 	if err != nil {
 		return nil, err
@@ -1112,7 +1115,7 @@ func (s *embStore) processDeadLetterQueue(ctx context.Context, be embedBackendCo
 		return nil, err
 	}
 
-	limiter := make(chan struct{}, 8)
+	limiter := make(chan struct{}, 32)
 
 	var flk sync.Mutex
 	var failPosts, failUsers []string
@@ -1161,6 +1164,7 @@ func (s *embStore) processDeadLetterQueue(ctx context.Context, be embedBackendCo
 		PostsFailed:   len(failPosts),
 		UsersComputed: len(body.Users) - len(failUsers),
 		UsersFailed:   len(failUsers),
+		ElapsedSecs:   time.Since(start).Seconds(),
 	}, nil
 }
 
@@ -1228,6 +1232,11 @@ func (s *embStore) refreshPostEmbByUri(ctx context.Context, uri string) error {
 func (s *embStore) refreshPostEmbByUriOnHost(ctx context.Context, host, uri string) error {
 	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
 	defer cancel()
+
+	start := time.Now()
+	defer func() {
+		refreshEmbeddingHist.WithLabelValues(host).Observe(time.Since(start).Seconds())
+	}()
 
 	puri, err := syntax.ParseATURI(uri)
 	if err != nil {
